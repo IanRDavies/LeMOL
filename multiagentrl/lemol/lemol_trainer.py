@@ -379,14 +379,14 @@ class LeMOLAgentTrainer(AgentTrainer):
             sum([act_s.n for act_s in act_space_n]) + reward_dim + done_dim
         self.lstm_input_dim = event_dim
         om_lstm = get_lstm_for_lemol(
-            self.args.use_standard_lstm,
-            self.lstm_input_dim,
-            act_space_n,
-            obs_shape_n,
-            event_dim,
-            lf_dim,
-            self.lstm_hidden_dim,
-            agent_index
+            use_standard_lstm=self.args.use_standard_lstm,
+            lstm_state_size=self.lstm_hidden_dim,
+            lstm_input_dim=self.lstm_input_dim,
+            act_space_n=act_space_n,
+            obs_shape_n=obs_shape_n,
+            event_dim=event_dim,
+            lf_dim=lf_dim,
+            agent_index=agent_index
         )
         lstm_input_ph = U.BatchInput(
             (None, self.lstm_input_dim), name='lemol_lstm_input_ph').get()
@@ -430,6 +430,8 @@ class LeMOLAgentTrainer(AgentTrainer):
                 scope=self.scope,
                 update_period_len=args.agent_update_freq,
                 history_embedding_dim=args.episode_embedding_dim,
+                recurrent_prediction_module=args.recurrent_om_prediction,
+                recurrent_prediction_dim=args.in_ep_lstm_dim
             )
         else:
             self.om_act, self.get_om_outputs, self.om_train, self.om_debug = om_train(

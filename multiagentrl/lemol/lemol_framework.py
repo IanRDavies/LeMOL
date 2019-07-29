@@ -17,7 +17,9 @@ from tensorflow.keras.backend import int_shape
 import multiagentrl.common.tf_util as U
 
 
-def get_lstm_for_lemol(use_standard_lstm, lstm_input_dim, act_space_n, obs_shape_n, event_dim, lf_dim, lstm_state_size, agent_index):
+def get_lstm_for_lemol(
+        use_standard_lstm, lstm_state_size, lstm_input_dim=None, act_space_n=None,
+        obs_shape_n=None, event_dim=None, lf_dim=None, agent_index=None):
     if use_standard_lstm:
         if tf.test.is_gpu_available():
             lstm = tf.keras.layers.CuDNNLSTM(

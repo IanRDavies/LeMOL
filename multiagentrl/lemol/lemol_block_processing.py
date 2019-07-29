@@ -74,7 +74,9 @@ def om_train_block_processing(
         update_period_len,
         history_embedding_dim,
         grad_norm_clipping=None,
-        reuse=None):
+        reuse=None,
+        recurrent_prediction_module=False,
+        recurrent_prediction_dim=32):
     with tf.variable_scope(scope, reuse=reuse):
         # Instantiate the opponent actions as a distribution.
         opp_act_space = make_pdtype(opp_act_space)
@@ -84,7 +86,7 @@ def om_train_block_processing(
         # a tensor of shape [number of periods x period length x lstm input shape]
         # This then enables the summary lstm model to map the sequences
         # of period length to a single vector.
-        batch_size = tf.shape(lstm_inputs)[0]
+        batch_size = tf.shape(observations_ph)[0]
         episodes = tf.reshape(
             lstm_inputs, (-1, update_period_len, lstm_inputs.shape[-1]))
         # Run the summary model.
@@ -96,6 +98,13 @@ def om_train_block_processing(
         # the main LSTM which models opponent learning.
         summaries = tf.reshape(
             episode_summaries, (batch_size, -1, history_embedding_dim))
+
+        # --------------------- Opponent Learning Modelling ---------------------
+        # We set up a placeholder to denote whether or not the model is being
+        # trained. During training full trajectories are passed in whereas
+        # during play (test time essentially) one prediction is made at a time.
+        # This boolean then allows us to account for the differing input shapes.
+        training = tf.placeholder(tf.bool, shape=(), name='lemol_om_training_boolean')
 
         # Setting up an initial state for the LSTM such that it is trainable.
         initial_h = tf.Variable(
@@ -133,8 +142,7 @@ def om_train_block_processing(
         # Taking the first three outputs is a fix to potentially using the
         # custom LeMOLLSTM (which has some internal learning feature generation
         # which we no longer use but are not yet prepared to fully remove).
-        hidden_activations, final_h, final_c = lstm(
-            summaries, initial_state=[h, c])[:3]
+        hidden_activations, final_h, final_c = lstm(summaries, initial_state=[h, c])[:3]
 
         # The hidden_activations (the h values) of the LSTM represent the
         # current point in learning of the opponent. There is one per
@@ -154,38 +162,34 @@ def om_train_block_processing(
         lf = tf.tile(lf, (1, 1, update_period_len, 1))
         lf = tf.reshape(lf, (batch_size, -1, lstm_hidden_dim))
 
-        # Create placeholders to allow switching between the use of the
+        # Create a placeholder to allow switching between the use of the
         # initial representation of the opponent's learning ('learning
-        # feature') and also to note whether we are to pass in a
-        # learning feature (as is used for in-play prediction) or
-        # use that generated from a sequence of original inputs (as
-        # is the case when training the opponent model).
+        # feature') or a previously generated one (from the preceding
+        # experience).
         use_initial_lf = tf.placeholder(
             tf.bool, shape=(), name='use_initial_learning_feature')
-        feeding_lf = tf.placeholder(
-            tf.bool, shape=(), name='feed_external_learning_feature')
 
         # Nested conditionals using the boolean placeholders defined
         # previously to put together and reshape the learning features
         # to be used alongside current observations for opponent action
         # prediction.
         learning_features = tf.cond(
-            # If the initial learning feature is required we give
-            # the learned initial h the right time dimension.
-            use_initial_lf,
-            lambda: tf.tile(tf.expand_dims(initial_h, 1),
-                            (1, tf.shape(observations_ph)[1], 1)),
-            # Otherwise we are feeding a learning feature (intended to be
-            # used for in play prediction - note that this lf is used for
-            # all observations showing an assumption that in this case
-            # predictions are for a single stage of opponent). Otherwise
-            # the learning features calculated from the play period summaries
-            # are used.
+            training,
+            lambda: lf,
             lambda: tf.cond(
-                feeding_lf,
-                lambda: tf.tile(tf.expand_dims(h_ph, 1),
+                use_initial_lf,
+                # If the initial learning feature is required we give
+                # the learned initial h the right time dimension.
+                lambda: tf.tile(tf.expand_dims(initial_h, 1),
                                 (1, tf.shape(observations_ph)[1], 1)),
-                lambda: lf
+                # Otherwise we are feeding a learning feature (intended
+                # to be used for in play prediction - note that this lf
+                # is used for all observations showing an assumption that
+                # in this case predictions are for a single stage of
+                # opponent). Otherwise the learning features calculated
+                # from the play period summaries are used.
+                lambda: tf.tile(tf.expand_dims(h_ph, 1),
+                                (1, tf.shape(observations_ph)[1], 1))
             )
         )
 
@@ -193,10 +197,22 @@ def om_train_block_processing(
         # a learned representation of the current opponent (their state
         # of learning). The prediction function itself is defined elsewhere
         # and is assumed to be a multi-layered perceptron.
-        opp_policy_input = tf.concat(
-            [observations_ph, learning_features], axis=-1)
+
+        if recurrent_prediction_module:
+            opp_pred_input, h_in_ep, c_in_ep, recurrent_om_vars, recurrent_om_feeds = build_recurrent_om_module(
+                learning_features=learning_features,
+                observations=observations_ph,
+                batch_size=batch_size,
+                update_period_len=update_period_len,
+                lstm_hidden_dim=lstm_hidden_dim,
+                num_units=recurrent_prediction_dim,
+                training_bool=training
+            )
+        else:
+            opp_pred_input = tf.concat([observations_ph, learning_features], axis=-1)
+
         om_logits = action_pred_func(
-            opp_policy_input,
+            opp_pred_input,
             scope='action_pred_func',
             num_units=num_units,
             num_outputs=opp_act_space.ncat
@@ -221,6 +237,8 @@ def om_train_block_processing(
         om_vars += lstm.weights
         om_vars += [initial_h, initial_c]
         om_vars += U.scope_vars(U.absolute_scope_name('action_pred_func'))
+        if recurrent_prediction_module:
+            om_vars += recurrent_om_vars
 
         # Opponent model training is performed as a regression problem targetting
         # the opponent's actions. The target values are therefore the opponents
@@ -261,9 +279,10 @@ def om_train_block_processing(
         # computation graph constructed above. This simplifies calling later
         # since we do not need to worry about TensorFlow sessions etc.
 
-        # The step function updates the state of the LSTM, It takes a series of
-        # LSTM inputs and observations and uses them to calculate a new LSTM
-        # state which itself represents the learning state of the opponent.
+        # The step function updates the state of the meta-learning LSTM, It
+        # takes a series of LSTM inputs and observations and uses them to
+        # calculate a new LSTM state which itself represents the learning
+        # state of the opponent.
         step = U.function(
             inputs=[lstm_inputs, observations_ph, h_ph, c_ph, use_initial_state],
             outputs=[final_h, final_c]
@@ -276,15 +295,34 @@ def om_train_block_processing(
         # partially apply it such that the learning feature used in prediction
         # is always the on generated from the original inputs rather than one
         # passed in.
+        # Control flow is in place to adapt to using the recurrent
+        # in episode model as appropriate.
+        training_inputs = [lstm_inputs, observations_ph, target_ph, h_ph, c_ph,
+                           use_initial_state, training, use_initial_lf]
+        training_outputs = [loss, training_summaries, final_h, final_c]
+        if recurrent_prediction_module:
+            training_inputs += [
+                recurrent_om_feeds['h'],
+                recurrent_om_feeds['c'],
+                recurrent_om_feeds['use_initial_state']
+            ]
+
         train_full = U.function(
-            inputs=[lstm_inputs, observations_ph, target_ph, h_ph, c_ph,
-                    use_initial_state, feeding_lf, use_initial_lf],
-            outputs=[loss, training_summaries, final_h, final_c],
+            inputs=training_inputs,
+            outputs=training_outputs,
             updates=[optimize_expr]
         )
 
         def train(i, o, t, h, c, init):
-            return train_full(i, o, t, h, c, init, False, False)
+            if recurrent_prediction_module:
+                # We always need to use the initial state for the in play recurrent model
+                # as we require that the inputs fed in for training are in complete episodes
+                # and we then reshape them to process them one episode at a time.
+                return train_full(
+                    i, o, t, h, c, init, True, False, np.zeros((1, num_units)), np.zeros((1, num_units)), True)
+            else:
+                # The extra recurrent model inputs are superfluous.
+                return train_full(i, o, t, h, c, init, True, False)
 
         # The act function essentially performs action prediction.
         # The inputs are many and varied because we need to feed
@@ -295,30 +333,148 @@ def om_train_block_processing(
         # never used (and so we may freely set their value to 0).
         # This is achieved by setting `use_initial_state` to False
         # so that when `use_initial_lf` is False the learning feature
-        # is given by the value passed to `h_ph`. `feeding_lf` is fixed
-        # to be True so that the learning feature is not calculated from
+        # is given by the value passed to `h_ph`. `training` is fixed
+        # to be False so that the learning feature is not calculated from
         # `lstm_inputs` but is taken from either the learned initial value
         # for the value fed in for `h_ph` (according to the value of
         # `use_initial_lf`).
         # The function `act_default` then uses the input observations
         # concatenated with either the initial or the supplied learning
         # feature to predict opponent actions.
+        # Control flow is again in place to adapt to using the recurrent
+        # in episode model as appropriate.
+        act_inputs = [observations_ph, h_ph, c_ph, use_initial_lf,
+                      training, use_initial_state, lstm_inputs]
+        act_outputs = [action_deter]
+        # We need slightly more inputs if we use a recurrent
+        # model within each episode.
+        if recurrent_prediction_module:
+            act_inputs += [
+                recurrent_om_feeds['h'],
+                recurrent_om_feeds['c'],
+                recurrent_om_feeds['use_initial_state']
+            ]
+            act_outputs += [h_in_ep, c_in_ep]
+
         act_full = U.function(
-            inputs=[observations_ph, h_ph, c_ph, use_initial_lf,
-                    feeding_lf, use_initial_state, lstm_inputs],
-            outputs=action_deter
+            inputs=act_inputs,
+            outputs=act_outputs
         )
 
-        def act(o, h, c, l):
-            return act_full(o, h, c, l, True, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))))
+        def act(o, h, c, l, h2=None, c2=None, init=False):
+            if recurrent_prediction_module:
+                return act_full(o, h, c, l, False, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))), h2, c2, init)
+            else:
+                # The extra recurrent model inputs are superfluous.
+                return act_full(o, h, c, l, False, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))))
 
+        # We do the same for the opponent model logits (useful
+        # for debugging) which require the same inputs and
+        # outputs as the action prediction calculation.
         logits_full = U.function(
-            inputs=[observations_ph, h_ph, c_ph, use_initial_lf,
-                    feeding_lf, use_initial_state, lstm_inputs],
+            inputs=act_inputs,
             outputs=om_logits
         )
 
-        def logits(o, h, c, l):
-            return logits_full(o, h, c, l, True, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))))
+        def logits(o, h, c, l, h2=None, c2=None, init=False):
+            if recurrent_prediction_module:
+                return logits_full(o, h, c, l, False, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))), h2, c2, init)
+            else:
+                # The extra recurrent model inputs are superfluous.
+                return logits_full(o, h, c, l, False, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))))
 
-        return act, step, train, {'om_logits': logits, 'initial_h': initial_h, 'initial_c': initial_c}
+        debug_dict = {'om_logits': logits, 'initial_h': initial_h, 'initial_c': initial_c}
+
+        if recurrent_prediction_module:
+            debug_dict['initial_h_in_ep'] = recurrent_om_feeds['h']
+            debug_dict['initial_c_in_ep'] = recurrent_om_feeds['c']
+        return act, step, train, debug_dict
+
+
+def build_recurrent_om_module(
+        learning_features, observations, batch_size, update_period_len, lstm_hidden_dim, num_units, training_bool):
+    # The opponent model takes in observations processed by an LSTM
+    # concatenated with a learned representation of the current
+    # opponent (their state of learning). We then pass this through
+    # a prediction function which is defined elsewhere and is assumed
+    # to be a multi-layered perceptron.
+
+    # We first establish how to reshape the input observations. During
+    # play they are passed one at a time. Otherwise they are reshaped to
+    # be in blocks of one episode of experience each so that the LSTM
+    # can process them all in parallel using the same initial state. This
+    # saves having to reset the state in the middle of a trajectory being
+    # processed or breaking up the trajectory more than necessary.
+    # NOTE: This relies on the data being passed in being an exact number
+    # of episodes and makes handling episodes of varied length difficult.
+    seq_len = tf.cond(training_bool, lambda: update_period_len, lambda: 1)
+    batch_episodes_reshaped = tf.cond(
+        training_bool,
+        lambda: batch_size * (tf.shape(observations)[1] // update_period_len),
+        lambda: 1
+    )
+    # Using the shapes calculated above we may reshape the data.
+    observations_in_episodes = tf.reshape(observations,
+                                          (-1, seq_len, observations.shape[-1]))
+
+    # We now set up the LSTM for processing the data within an episode
+    # with a learnable state that can be learned and passed around as
+    # required. We are also batch size agnostic in order to be able to
+    # handle running in play and in training where batch sizes and
+    # trajectory lengths differ.
+    # The following LSTM set up is very similar to that of the meta
+    # modelling section.
+    use_initial_in_ep_state = tf.placeholder(
+        tf.bool, shape=(), name='use_learned_initial_state_in_episode_ph')
+    initial_h_in_ep = tf.Variable(
+        tf.zeros((1, num_units)), name='LeMOL_om_initial_h_in_ep')
+    initial_c_in_ep = tf.Variable(
+        tf.zeros((1, num_units)), name='LeMOL_om_initial_c_in_ep')
+    h_in_ep_ph = tf.placeholder(
+        tf.float32, (None, num_units), 'LeMOL_om_h_in_ep_ph')
+    c_in_ep_ph = tf.placeholder(
+        tf.float32, (None, num_units), 'LeMOL_om_c_in_ep_ph')
+
+    # Adapt the LSTM state to be suitable for the current data
+    h_in_ep = tf.cond(
+        use_initial_in_ep_state,
+        lambda: tf.tile(initial_h_in_ep, (batch_episodes_reshaped, 1)),
+        lambda: h_in_ep_ph
+    )
+    c_in_ep = tf.cond(
+        use_initial_in_ep_state,
+        lambda: tf.tile(initial_c_in_ep, (batch_episodes_reshaped, 1)),
+        lambda: c_in_ep_ph
+    )
+    # Set up an LSTM to process the data within an episode.
+    # This is handled by the helper function defined in the
+    # `lemol_framework` file.
+    in_ep_lstm = get_lstm_for_lemol(
+        use_standard_lstm=True,
+        lstm_state_size=num_units
+    )
+    # Run the LSTM and collect the end state as well as the
+    # processed observation state.
+    processed_obs, final_h_in_ep, final_c_in_ep = in_ep_lstm(
+        observations_in_episodes,
+        initial_state=[h_in_ep, c_in_ep])
+
+    # The opponent action prediction function ultimately takes
+    # in the processed observations (the in play game state)
+    # along with a representation of the opponent's learning
+    # progress. To allow for this in both training and testing
+    # we reshape the processed observations to be back to the
+    # full episode length so that they can be concatenated with
+    # the learning features calculated elsewhere.
+    reshaped_processed_obs = tf.reshape(processed_obs, (batch_size, -1, num_units))
+
+    # Form the inputs for the opponent model prediction function.
+    opp_pred_input = tf.concat([reshaped_processed_obs, learning_features], axis=-1)
+
+    # Collect the weights and inputs of the submodule created
+    # within this function to facilitate learning and function
+    # calls into this part of the computation graph from elsewhere.
+    weights = in_ep_lstm.weights + [initial_c_in_ep, initial_h_in_ep]
+    feeds = {'h': h_in_ep_ph, 'c': c_in_ep_ph, 'use_initial_state': use_initial_in_ep_state}
+
+    return opp_pred_input, final_h_in_ep, final_c_in_ep, weights, feeds

@@ -129,6 +129,9 @@ def parse_args():
     parser.add_argument('--episode_embedding_dim', type=int, default=128,
                         help='dimension of episode summary')
     parser.add_argument('--block_processing', default=False, action='store_true')
+    parser.add_argument('--recurrent_om_prediction', default=False, action='store_true')
+    parser.add_argument('--in_ep_lstm_dim', type=int, default=32,
+                        help='dimension of lstm used within each episode (if required)')
 
     # Logging
     parser.add_argument('--log_dir', type=str, default=None,
@@ -643,7 +646,8 @@ def do_in_play_logging(
 
 
 def get_lemol_om_pred(current_pairing, action_n, obs_n, h, c, episode_step, episode_events,
-                        episode_obs, lemol_agent_index, use_initial_lf_state, update_lf, arglist):
+                      episode_obs, lemol_agent_index, use_initial_lf_state, update_lf,
+                      arglist, in_ep_h=None, in_ep_c=None):
     # Work out the dimension of the opponent's policy.
     opp_act_dim = len(action_n[1-lemol_agent_index])
     # If we are using an oracle
@@ -690,9 +694,15 @@ def get_lemol_om_pred(current_pairing, action_n, obs_n, h, c, episode_step, epis
                 use_initial_lf_state = False
             # Given the learning feature calculated from history we can perform
             # opponent action prediction.
-            om_pred = lemol_agent.om_act(
-                obs_n[lemol_agent_index][None][None], h, c, use_initial_lf_state
-            )
+            if arglist.recurrent_om_prediction:
+                om_pred, in_ep_h, in_ep_c = lemol_agent.om_act(
+                    obs_n[lemol_agent_index][None][None], h, c, use_initial_lf_state,
+                    in_ep_h, in_ep_c, episode_step==0
+                )
+            else:
+                om_pred = lemol_agent.om_act(
+                    obs_n[lemol_agent_index][None][None], h, c, use_initial_lf_state
+                )
             if arglist.discrete_actions:
                 z = np.zeros_like(om_pred)
                 z[np.argmax(om_pred)] = 1
@@ -709,7 +719,10 @@ def get_lemol_om_pred(current_pairing, action_n, obs_n, h, c, episode_step, epis
                 om_pred[np.argmax(action_n[1 - lemol_agent_index])] = 1.0
             else:
                 om_pred = action_n[1-lemol_agent_index]
-    return om_pred, h, c, use_initial_lf_state
+    if arglist.recurrent_om_prediction:
+        return om_pred, h, c, use_initial_lf_state, in_ep_h, in_ep_c
+    else:
+        return om_pred, h, c, use_initial_lf_state
 
 
 def collect_experience(
@@ -822,6 +835,9 @@ def train(arglist):
                     agent_info = [[[], []] for _ in range(arglist.num_episodes)] # placeholder for benchmarking info
                     # Initialise lemol stuff for later opponent model updating.
                     om_pred = None
+                    if arglist.recurrent_om_prediction:
+                        in_ep_h = np.zeros((1, arglist.in_ep_lstm_dim))
+                        in_ep_c = np.zeros_like(in_ep_h)
                     h = np.zeros((1, lemol_agent.lstm_hidden_dim))
                     c = np.zeros_like(h)
                     agent_update_freq = arglist.agent_update_freq
@@ -869,10 +885,16 @@ def train(arglist):
                                 # the timing fits with the opponent learning update frequency.
                                 update_lf = (post_exploration_steps >= agent_update_freq 
                                                 and (post_exploration_steps % agent_update_freq) == 0)
-                                om_pred, h, c, use_initial_lf_state = get_lemol_om_pred(
-                                    current_pairing, action_n, obs_n, h, c,
-                                    episode_step, episode_events, episode_obs, lemol_agent_index,
-                                    use_initial_lf_state, update_lf, arglist)
+                                if arglist.recurrent_om_prediction:
+                                    om_pred, h, c, use_initial_lf_state, in_ep_h, in_ep_c = get_lemol_om_pred(
+                                        current_pairing, action_n, obs_n, h, c,
+                                        episode_step, episode_events, episode_obs, lemol_agent_index,
+                                        use_initial_lf_state, update_lf, arglist, in_ep_h, in_ep_c)
+                                else:
+                                    om_pred, h, c, use_initial_lf_state = get_lemol_om_pred(
+                                        current_pairing, action_n, obs_n, h, c,
+                                        episode_step, episode_events, episode_obs, lemol_agent_index,
+                                        use_initial_lf_state, update_lf, arglist)
 
                                 # With the opponent's action prediction in hand we may attain an
                                 # action from LeMOL.
