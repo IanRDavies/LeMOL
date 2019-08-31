@@ -7,7 +7,6 @@ from multiagentrl.common.distributions import make_pdtype
 from multiagentrl.common.agent_trainer import AgentTrainer
 from multiagentrl.lemol import LeMOLAgentTrainer
 from multiagentrl.common.replay_buffer import ReplayBuffer
-from multiagentrl.maddpg.maddpg_om import MADDPGOMAgentTrainer
 
 
 # def discount_with_dones(rewards, dones, gamma):
@@ -21,8 +20,8 @@ from multiagentrl.maddpg.maddpg_om import MADDPGOMAgentTrainer
 
 
 def p_train(
-        make_obs_ph_n, act_space_n, p_index, p_func, q_func, optimizer, adversarial, adv_eps, adv_eps_s,
-        num_adversaries, grad_norm_clipping=None, local_q_func=False, num_units=64, scope='trainer', reuse=None, polyak=1e-4):
+        make_obs_ph_n, act_space_n, p_index, p_func, q_func, optimizer, adversarial, adv_eps, adv_eps_s, num_adversaries,
+        grad_norm_clipping=None, local_q_func=False, num_units=64, scope='trainer', reuse=None, polyak=1e-4):
     # p_index is the agent index.
     with tf.variable_scope(scope, reuse=reuse):
         # create action distributions
@@ -56,7 +55,6 @@ def p_train(
 
         if local_q_func:
             # If only using observation and action from a single agent.
-            # as in the case of MADDPG
             q_input = tf.concat([obs_ph_n[p_index], act_input_n[p_index]], 1)
         else:
             # Centralised q function takes in all observations and all actions.
@@ -95,7 +93,7 @@ def p_train(
             # Add the perturbation to the actions of all other agents.
             new_act_n = [perturb[i] + act_input_n[i] if i != p_index
                          else act_input_n[i] for i in range(len(act_input_n))]
-            # Collect inputs and calculate the q values from the adversatial set up.
+            # Collect inputs and calculate the q values from the adversarial set up.
             adv_q_input = tf.concat(obs_ph_n + new_act_n, 1)
             adv_q = q_func(adv_q_input, 1, scope='q_func',
                            reuse=True, num_units=num_units)[:, 0]
@@ -112,6 +110,7 @@ def p_train(
         # Create callable functions for training, actions and policy.
         train = U.function(inputs=obs_ph_n + act_ph_n,
                            outputs=loss, updates=[optimize_expr])
+
         act = U.function(inputs=[obs_ph_n[p_index]], outputs=act_sample)
         logits = U.function(inputs=[obs_ph_n[p_index]], outputs=p)
 
@@ -159,7 +158,7 @@ def q_train(
         target_ph = tf.placeholder(tf.float32, [None], name='target')
 
         if local_q_func:
-            # Local q function (used for MADDPG but not M3DDPG) is for one agent only.
+            # Local q function.
             q_input = tf.concat([obs_ph_n[q_index], act_ph_n[q_index]], 1)
         else:
             # Centralised Q function takes in observations and actions from all agents.
@@ -172,7 +171,6 @@ def q_train(
         # Train on the squared loss to an externally constructed (TD) target.
         q_loss = tf.reduce_mean(tf.square(q - target_ph))
 
-        # COMMENTED AS NOT USED IN THEIR PUBLISHED CODE
         # viscosity solution to Bellman differential equation in place of an initial condition
         # q_reg = tf.reduce_mean(tf.square(q))
 
@@ -323,12 +321,8 @@ class MADDPGAgentTrainer(AgentTrainer):
         act_n = []
         index = self.replay_sample_index
         for i in range(self._num_agents):
-            if isinstance(agents[i], LeMOLAgentTrainer) or isinstance(agents[i], MADDPGOMAgentTrainer):
-                obs, act, _, obs_next = agents[i].replay_buffer.sample_index(
-                    index)[:4]
-            else:
-                obs, act, _, obs_next, _ = agents[i].replay_buffer.sample_index(
-                    index)
+            obs, act, _, obs_next, _ = agents[i].replay_buffer.sample_index(
+                index)[:5]
             obs_n.append(obs)
             obs_next_n.append(obs_next)
             act_n.append(act)
@@ -346,7 +340,7 @@ class MADDPGAgentTrainer(AgentTrainer):
             )
         else:
             target_act_next_n = [agents[i].p_debug['target_act'](
-                obs_next_n[i]) for i in range(self.n)]
+                obs_next_n[i]) for i in range(self._num_agents)]
         target_q_next = self.q_debug['target_q_values'](
             *(obs_next_n + target_act_next_n))
         target_q = rew + self.args.gamma * (1.0 - done) * target_q_next

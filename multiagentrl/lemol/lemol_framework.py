@@ -17,6 +17,112 @@ from tensorflow.keras.backend import int_shape
 import multiagentrl.common.tf_util as U
 
 
+def build_triplet_loss(all_h, positive_dist, negative_dist):
+    '''
+    Implements a triplet loss similar to that of Grover et al. (2018)
+    which encourages representations of similar agents to be close
+    and of further way agents to be different.
+
+    In the case of LeMOL it is formed from a sequence of the opponent
+    representations. Similar agents are considered to be close together
+    in time as they have fewer parameter updates differentiating them.
+    Further away agents are more distant in their learning and hence are
+    encouraged to be more different.
+
+    Inspired by Grover et al. (2018): Learning policy representations
+    in multiagent systems.
+
+    Args
+    all_h: Tensorflow tensor - The sequence of opponent representations
+        in chronological order.
+    positive_dist: int - The maximum number of timesteps between a
+        reference representation and the positive example.
+    negative_dist: int - The minimum number of timesteps between the
+        reference representation and the negative example. 
+    '''
+    # We build the loss by considering two samples for the triplets.
+    # One sample is where the base representation is early in the
+    # trajectory segment and another where the base representation
+    # comes later.
+
+    # We sample two sets of indices to offset between the base and the
+    # positive and negative samples respectively. This is done to
+    # ensure thatthe offset if not fixed which may bias learning.
+    close_indices_1 = tf.random.uniform(
+        shape=(tf.shape(all_h)[0],),
+        minval=1,
+        maxval=positive_dist+1,
+        dtype=tf.int32
+    )
+    close_indices_2 = tf.random.uniform(
+        shape=(tf.shape(all_h)[0],),
+        minval=1,
+        maxval=positive_dist+1,
+        dtype=tf.int32
+    )
+    # Sample a set of indices which form the positive representation sample.
+    early_pos_idx = tf.random.uniform(
+        shape=(tf.shape(all_h)[0],),
+        minval=0,
+        maxval=tf.shape(all_h)[1] - negative_dist - positive_dist,
+        dtype=tf.int32
+    )
+    # The reference example is close to but not the same as the positive example.
+    early_ref_idx = early_pos_idx + close_indices_1
+    # The negative example is further away with some noise added to the offset.
+    early_neg_idx = early_pos_idx + negative_dist + close_indices_2
+
+    # We then perform a similar sampling of indices for the sample where the
+    # reference point is later in the trajectory.
+    close_indices_3 = tf.random.uniform(
+        shape=(tf.shape(all_h)[0],),
+        minval=1,
+        maxval=positive_dist+1,
+        dtype=tf.int32
+    )
+    close_indices_4 = tf.random.uniform(
+        shape=(tf.shape(all_h)[0],),
+        minval=1,
+        maxval=positive_dist+1,
+        dtype=tf.int32
+    )
+    # We sample a set of indices towards the end of the trajectory
+    # segment as positive examples.
+    late_pos_idx = tf.random.uniform(
+        shape=(tf.shape(all_h)[0],),
+        minval=negative_dist + positive_dist,
+        maxval=tf.shape(all_h)[1],
+        dtype=tf.int32
+    )
+    # We then form the reference examples using some small offset.
+    late_ref_idx = late_pos_idx - close_indices_3
+    # With negative examples being sampled further away.
+    late_neg_idx = late_pos_idx - negative_dist - close_indices_4
+
+    # Having sampled indices it is necessary to attain the values
+    # relating to these indices.
+    h_early_pos = tf.gather(all_h, early_pos_idx, axis=1)
+    h_early_ref = tf.gather(all_h, early_ref_idx, axis=1)
+    h_early_neg = tf.gather(all_h, early_neg_idx, axis=1)
+
+    h_late_pos = tf.gather(all_h, late_pos_idx, axis=1)
+    h_late_ref = tf.gather(all_h, late_ref_idx, axis=1)
+    h_late_neg = tf.gather(all_h, late_neg_idx, axis=1)
+
+    # We then use the norm of differences between the representations to
+    # formulate a loss which encourages representations closer together in
+    # time to be similar while distinct from those further away in time.
+    l1 = tf.reduce_mean(tf.reduce_sum(tf.square(h_early_ref - h_early_neg), axis=[1, 2]))
+    l3 = tf.reduce_mean(tf.reduce_sum(tf.square(h_early_ref - h_early_pos), axis=[1, 2]))
+
+    l2 = tf.reduce_mean(tf.reduce_sum(tf.square(h_late_ref - h_late_neg), axis=[1, 2]))
+    l4 = tf.reduce_mean(tf.reduce_sum(tf.square(h_late_ref - h_late_pos), axis=[1, 2]))
+
+    # The final loss is formed using equation 2 of Grover et al. (2018)
+    loss = 1. / tf.square((1 + tf.exp((l1+l2)-(l3+l4))))
+    return loss
+
+
 def get_lstm_for_lemol(
         use_standard_lstm, lstm_state_size, lstm_input_dim=None, act_space_n=None,
         obs_shape_n=None, event_dim=None, lf_dim=None, agent_index=None):

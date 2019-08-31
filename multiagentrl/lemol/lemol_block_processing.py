@@ -10,7 +10,7 @@ import multiagentrl.common.tf_util as U
 from multiagentrl.common.distributions import make_pdtype, SoftMultiCategoricalPd
 from multiagentrl.common.agent_trainer import AgentTrainer
 from multiagentrl.common.replay_buffer import LeMOLReplayBuffer
-from .lemol_framework import get_lstm_for_lemol
+from .lemol_framework import get_lstm_for_lemol, build_triplet_loss
 
 
 def summarise_periods(lstm_inputs, embedding_size, scope, reuse=None):
@@ -39,7 +39,7 @@ def summarise_periods(lstm_inputs, embedding_size, scope, reuse=None):
         # back up when we concat the RNN outcomes
         embedding_size = embedding_size // 2
 
-        # Set up the LSTM using the GPU optimsed version were appropriate.
+        # Set up the LSTM using the GPU optimised version were appropriate.
         if tf.test.is_gpu_available():
             lstm = tf.keras.layers.CuDNNLSTM(units=embedding_size)
         else:
@@ -74,9 +74,13 @@ def om_train_block_processing(
         update_period_len,
         history_embedding_dim,
         grad_norm_clipping=None,
+        ablate_lstm=False,
         reuse=None,
         recurrent_prediction_module=False,
-        recurrent_prediction_dim=32):
+        recurrent_prediction_dim=32,
+        use_representation_loss=False,
+        positive_dist=3,
+        negative_dist=15):
     with tf.variable_scope(scope, reuse=reuse):
         # Instantiate the opponent actions as a distribution.
         opp_act_space = make_pdtype(opp_act_space)
@@ -92,6 +96,7 @@ def om_train_block_processing(
         # Run the summary model.
         episode_summaries, summary_vars = summarise_periods(
             episodes, history_embedding_dim, scope, reuse)
+        get_ep_summaries = U.function([observations_ph, lstm_inputs], episode_summaries)
         # Reshape the outputs to be of the shape
         # batch_size x sequence length (in summary periods) x period embedding dimension
         # This is the final step in preparing the original inputs for passing them through
@@ -144,6 +149,13 @@ def om_train_block_processing(
         # which we no longer use but are not yet prepared to fully remove).
         hidden_activations, final_h, final_c = lstm(summaries, initial_state=[h, c])[:3]
 
+        # Building the graph for the optional triplet loss is handled by
+        # the LeMOL framework.
+        if use_representation_loss:
+            representation_loss_weight = tf.placeholder(tf.float32, (), 'representation_loss_weight')
+            all_h = tf.concat([tf.expand_dims(h, 1), hidden_activations], axis=1)
+            representation_loss = build_triplet_loss(all_h, positive_dist, negative_dist)
+
         # The hidden_activations (the h values) of the LSTM represent the
         # current point in learning of the opponent. There is one per
         # summarised period. However, we wish to make a prediction of
@@ -158,9 +170,9 @@ def om_train_block_processing(
         # can be concatenated with the current observations to be used in opponent
         # action prediction.
         lf = tf.concat([tf.expand_dims(h, 1), hidden_activations[:, :-1]], axis=1)
-        lf = tf.reshape(lf, (batch_size, -1, 1, lstm_hidden_dim))
+        lf = tf.reshape(lf, (batch_size, -1, 1, lstm_hidden_dim), name='zzz')
         lf = tf.tile(lf, (1, 1, update_period_len, 1))
-        lf = tf.reshape(lf, (batch_size, -1, lstm_hidden_dim))
+        lf = tf.reshape(lf, (batch_size, -1, lstm_hidden_dim), 'kkk')
 
         # Create a placeholder to allow switching between the use of the
         # initial representation of the opponent's learning ('learning
@@ -199,14 +211,15 @@ def om_train_block_processing(
         # and is assumed to be a multi-layered perceptron.
 
         if recurrent_prediction_module:
-            opp_pred_input, h_in_ep, c_in_ep, recurrent_om_vars, recurrent_om_feeds = build_recurrent_om_module(
+            opp_pred_input, h_in_ep, c_in_ep, recurrent_om_vars, recurrent_om_feeds, recurrent_om_debug = build_recurrent_om_module(
                 learning_features=learning_features,
                 observations=observations_ph,
                 batch_size=batch_size,
                 update_period_len=update_period_len,
                 lstm_hidden_dim=lstm_hidden_dim,
                 num_units=recurrent_prediction_dim,
-                training_bool=training
+                training_bool=training,
+                ablate_lemol=ablate_lstm
             )
         else:
             opp_pred_input = tf.concat([observations_ph, learning_features], axis=-1)
@@ -233,12 +246,13 @@ def om_train_block_processing(
 
         # Collect variables for training.
         # This seems to contain some repeat values but this does not matter.
-        om_vars = summary_vars
-        om_vars += lstm.weights
-        om_vars += [initial_h, initial_c]
-        om_vars += U.scope_vars(U.absolute_scope_name('action_pred_func'))
+        om_vars = U.scope_vars(U.absolute_scope_name('action_pred_func'))
         if recurrent_prediction_module:
             om_vars += recurrent_om_vars
+        if not ablate_lstm:
+            om_vars += summary_vars
+            om_vars += lstm.weights
+            om_vars += [initial_h, initial_c]
 
         # Opponent model training is performed as a regression problem targetting
         # the opponent's actions. The target values are therefore the opponents
@@ -251,7 +265,10 @@ def om_train_block_processing(
             labels=target_ph,
             logits=om_logits
         ))
-
+        # If we are using a representation loss we build it using the function
+        # defined in the framework file.
+        if use_representation_loss:
+            loss += representation_loss_weight * representation_loss
         # Optimisations is conducted with the supplied optimiser with no variable
         # clipping. Optimisation is performed with respect to the variables collected
         # above.
@@ -306,6 +323,8 @@ def om_train_block_processing(
                 recurrent_om_feeds['c'],
                 recurrent_om_feeds['use_initial_state']
             ]
+        if use_representation_loss:
+            training_inputs += [representation_loss_weight]
 
         train_full = U.function(
             inputs=training_inputs,
@@ -313,16 +332,29 @@ def om_train_block_processing(
             updates=[optimize_expr]
         )
 
-        def train(i, o, t, h, c, init):
+        def train(i, o, t, h, c, init, w=0):
             if recurrent_prediction_module:
                 # We always need to use the initial state for the in play recurrent model
                 # as we require that the inputs fed in for training are in complete episodes
                 # and we then reshape them to process them one episode at a time.
-                return train_full(
-                    i, o, t, h, c, init, True, False, np.zeros((1, num_units)), np.zeros((1, num_units)), True)
+                if use_representation_loss:
+                    return train_full(
+                        i, o, t, h, c, init, True, False,
+                        np.zeros((1, recurrent_prediction_dim)),
+                        np.zeros((1, recurrent_prediction_dim)),
+                        True, w)
+                else:
+                    return train_full(
+                        i, o, t, h, c, init, True, False,
+                        np.zeros((1, recurrent_prediction_dim)),
+                        np.zeros((1, recurrent_prediction_dim)),
+                        True)
             else:
                 # The extra recurrent model inputs are superfluous.
-                return train_full(i, o, t, h, c, init, True, False)
+                if use_representation_loss:
+                    return train_full(i, o, t, h, c, init, True, False, w)
+                else:
+                    return train_full(i, o, t, h, c, init, True, False)
 
         # The act function essentially performs action prediction.
         # The inputs are many and varied because we need to feed
@@ -361,12 +393,15 @@ def om_train_block_processing(
             outputs=act_outputs
         )
 
-        def act(o, h, c, l, h2=None, c2=None, init=False):
+        def act(o, h, l, h2=None, c2=None, init=False):
             if recurrent_prediction_module:
-                return act_full(o, h, c, l, False, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))), h2, c2, init)
+                return act_full(o, h, np.zeros_like(h), l, False, False,
+                                np.zeros((int(o.shape[0]), update_period_len, int(lstm_inputs.shape[-1]))),
+                                h2, c2, init)
             else:
                 # The extra recurrent model inputs are superfluous.
-                return act_full(o, h, c, l, False, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))))
+                return act_full(o, h, np.zeros_like(h), l, False, False,
+                                np.zeros((int(o.shape[0]), update_period_len, int(lstm_inputs.shape[-1]))))
 
         # We do the same for the opponent model logits (useful
         # for debugging) which require the same inputs and
@@ -376,23 +411,27 @@ def om_train_block_processing(
             outputs=om_logits
         )
 
-        def logits(o, h, c, l, h2=None, c2=None, init=False):
+        def logits(o, h, l, h2=None, c2=None, init=False):
             if recurrent_prediction_module:
-                return logits_full(o, h, c, l, False, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))), h2, c2, init)
+                return logits_full(o, h, np.zeros_like(h), l, False, False,
+                                   np.zeros((int(o.shape[0]), update_period_len, int(lstm_inputs.shape[-1]))),
+                                   h2, c2, init)
             else:
                 # The extra recurrent model inputs are superfluous.
-                return logits_full(o, h, c, l, False, False, np.zeros((1, update_period_len, int(lstm_inputs.shape[-1]))))
+                return logits_full(o, h, np.zeros_like(h), l, False, False,
+                                   np.zeros((int(o.shape[0]), update_period_len, int(lstm_inputs.shape[-1]))))
 
-        debug_dict = {'om_logits': logits, 'initial_h': initial_h, 'initial_c': initial_c}
+        debug_dict = {'om_logits': logits, 'initial_h': initial_h,
+                      'initial_c': initial_c, 'summaries': get_ep_summaries}
 
         if recurrent_prediction_module:
-            debug_dict['initial_h_in_ep'] = recurrent_om_feeds['h']
-            debug_dict['initial_c_in_ep'] = recurrent_om_feeds['c']
+            debug_dict['initial_h_in_ep'] = recurrent_om_debug['initial_h']
+            debug_dict['initial_c_in_ep'] = recurrent_om_debug['initial_c']
         return act, step, train, debug_dict
 
 
 def build_recurrent_om_module(
-        learning_features, observations, batch_size, update_period_len, lstm_hidden_dim, num_units, training_bool):
+        learning_features, observations, batch_size, update_period_len, lstm_hidden_dim, num_units, training_bool, ablate_lemol=False):
     # The opponent model takes in observations processed by an LSTM
     # concatenated with a learned representation of the current
     # opponent (their state of learning). We then pass this through
@@ -470,11 +509,14 @@ def build_recurrent_om_module(
 
     # Form the inputs for the opponent model prediction function.
     opp_pred_input = tf.concat([reshaped_processed_obs, learning_features], axis=-1)
+    if ablate_lemol:
+        opp_pred_input = reshaped_processed_obs
 
     # Collect the weights and inputs of the submodule created
     # within this function to facilitate learning and function
     # calls into this part of the computation graph from elsewhere.
     weights = in_ep_lstm.weights + [initial_c_in_ep, initial_h_in_ep]
     feeds = {'h': h_in_ep_ph, 'c': c_in_ep_ph, 'use_initial_state': use_initial_in_ep_state}
+    debug = {'initial_h': initial_h_in_ep, 'initial_c': initial_c_in_ep}
 
-    return opp_pred_input, final_h_in_ep, final_c_in_ep, weights, feeds
+    return opp_pred_input, final_h_in_ep, final_c_in_ep, weights, feeds, debug

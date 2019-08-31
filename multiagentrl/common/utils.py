@@ -7,7 +7,7 @@ def numpy_softmax(x, axis=None):
     m = np.max(x)
     _x = x - m
     _exp = np.exp(_x)
-    return _x / (np.sum(_x, keepdims=True, axis=axis) + EPSILON)
+    return _exp / (np.sum(_exp, keepdims=True, axis=axis) + EPSILON)
 
 
 def top_1_accuracy_from_pred(p, q):

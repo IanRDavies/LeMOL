@@ -4,17 +4,13 @@ from copy import deepcopy
 import tensorflow as tf
 import time
 import pickle
-import sys
 import os
 import random
-
-sys.path.append('../')
-sys.path.append('../../')
-sys.path.append('../../../')
 
 import multiagentrl.common.tf_util as U
 from multiagentrl.maddpg import MADDPGAgentTrainer
 from multiagentrl.lemol import LeMOLAgentTrainer
+from multiagentrl.ppo import PPOAgentTrainer, do_in_play_logging_with_ppo
 
 from custom_environments import UAVEnv
 
@@ -35,7 +31,7 @@ def parse_args():
                         help='name of the scenario script')
     parser.add_argument('--max_episode_len', type=int, default=25,
                         help='maximum episode length')
-    parser.add_argument('--num_episodes', type=int, default=10000,
+    parser.add_argument('--num_episodes', type=int, default=11024,
                         help='number of episodes')
     parser.add_argument('--num_adversaries', type=int, default=1,
                         help='number of adversaries')
@@ -72,7 +68,7 @@ def parse_args():
                         help='adversarial training rate')
     parser.add_argument('--adv_eps_s', type=float, default=1e-5,
                         help='small adversarial training rate')
-    parser.add_argument('--agent_update_freq', type=int, default=1,
+    parser.add_argument('--agent_update_freq', type=int, default=25,
                         help='number of timesteps between policy training updates')
     parser.add_argument('--polyak', type=float, default=1e-4,
                         help='update portion value for target network')
@@ -110,9 +106,9 @@ def parse_args():
     # LeMOL
     parser.add_argument('--omlr', type=float, default=1e-3,
                         help='learning rate for Adam optimizer')
-    parser.add_argument('--lstm_hidden_dim', type=int, default=32,
+    parser.add_argument('--lstm_hidden_dim', type=int, default=64,
                         help='dimensionality of lstm hidden activations for LeMOL Opponent Model')
-    parser.add_argument('--learning_feature_dim', type=int, default=32,
+    parser.add_argument('--learning_feature_dim', type=int, default=64,
                         help='dimensionality of LeMOL (om) learning feature')
     parser.add_argument('--lemol_save_path', type=str, default=None,
                         help='path to save experience for om training')
@@ -132,6 +128,32 @@ def parse_args():
     parser.add_argument('--recurrent_om_prediction', default=False, action='store_true')
     parser.add_argument('--in_ep_lstm_dim', type=int, default=32,
                         help='dimension of lstm used within each episode (if required)')
+    parser.add_argument('--use_triplet_representation_loss', default=False, action='store_true')
+    parser.add_argument('--rep_loss_pos_dist', type=int, default=3,
+                        help='Maximum number of periods between reference and positive examples for representation loss')
+    parser.add_argument('--rep_loss_neg_dist', type=int, default=40,
+                        help='Minimum number of periods between reference and negative examples for representation loss')
+    parser.add_argument('--representation_loss_weight', type=float, default=0.1,
+                        help='Weighting of representation loss in overall OM loss')
+    parser.add_argument('--representation_loss_weight_decay_base', type=float, default=15,
+                        help='Base value used for calculating the representation loss weight decay (base/(base+iter))')
+
+    # PPO
+    parser.add_argument('--ppo_lambda', type=float, default=0.97,
+                        help='Lambda for GAE-Lambda. (Always between 0 and 1, close to 1.)')
+    parser.add_argument('--ppo_pi_lr', type=float, default=3e-4,
+                        help='learning rate for PPO policy optimizer')
+    parser.add_argument('--ppo_vf_lr', type=float, default=1e-3,
+                        help='learning rate for PPO value function optimizer')
+    parser.add_argument('--ppo_target_kl', type=float, default=0.01,
+                        help='Approximate KL divergence between new and old policies after a PPO update. Used for early stopping.')
+    parser.add_argument('--ppo_clip_ratio', type=float, default=0.2,
+                        help='Hyperparameter for clipping in the PPO policy objective.')
+    parser.add_argument('--ppo_train_cycles', type=int, default=80,
+                        help='Number of optimisation steps per PPO update')
+    parser.add_argument('--ppo_history_length', type=int, default=250,
+                        help='Length of history used in PPO updates.')
+    parser.add_argument('--verbose_ppo', default=False, action='store_true')
 
     # Logging
     parser.add_argument('--log_dir', type=str, default=None,
@@ -149,17 +171,27 @@ def parse_args():
     parser.add_argument('--feed_lemol_true_action', default=False, action='store_true')
     parser.add_argument('--lemol_true_action_feed_proportion', type=float, default=1.0,
                         help='When using feed_lemol_true_action true actions are given randomly' +
-                             'with this probability with random noise provided with complementary probability')
+                             'with this probability with random noise provided with complementary probability')    
+    parser.add_argument('--lemol_oracle_baseline_acc', type=float, default=0.55,
+                             help='When using feed_lemol_true_action true actions are given randomly' +
+                                  'with this probability when outside of the true action feed period defined above.')
     parser.add_argument('--feed_lemol_true_action_before', type=int, default=25,
                         help='feed true actions to lemol in episode before this time step (depends on feed_lemol_true_action)')
     parser.add_argument('--feed_lemol_true_action_after', type=int, default=-1,
                         help='feed true actions to lemol in episode after this time step (depends on feed_lemol_true_action)')
-    parser.add_argument('--use_standard_lstm', default=True, action='store_false')
+    parser.add_argument('--use_alternative_lstm', default=False, action='store_true')
+    parser.add_argument('--ablate_lemol_lstm', default=False, action='store_true')
+    parser.add_argument('--decentralise_lemol_obs', default=False, action='store_true')
+    parser.add_argument('--fully_decentralise_lemol', default=False, action='store_true')
 
     arglist = parser.parse_args()
     args = build_save_and_log_directories(arglist)
     if args.block_processing:
         args.chunk_length = args.chunk_length * args.agent_update_freq
+    # If LeMOL is to be fully decentralised then we must only consider
+    # the observations at hand -> decentralise observations
+    if args.fully_decentralise_lemol:
+        args.decentralise_lemol_obs = True
     return args
 
 
@@ -176,7 +208,7 @@ def build_save_and_log_directories(arglist):
         args.log_dir = os.path.join(base, 'logging')
     if args.lemol_save_path is None:
         b = base.lstrip('.').strip('/')
-        args.lemol_save_path = './' + b + '/{}_vs_{}/OM{}/{}.npz'
+        args.lemol_save_path = './' + b
     return args
 
 
@@ -275,8 +307,8 @@ def benchmark_and_end(agent_info, infos, train_step, done, terminal, episodes_co
 
 
 def save_and_do_logging(
-    current_pairing, saver, episode_rewards, agent_rewards, final_ep_rewards, final_ep_ag_rewards, num_adversaries,
-    t_start, train_step, summary_feeds, avg_r_summary, episodes_completed, average_episode_length, traj_writer, arglist):
+        current_pairing, saver, episode_rewards, agent_rewards, final_ep_rewards, final_ep_ag_rewards, num_adversaries,
+        t_start, train_step, summary_feeds, avg_r_summary, episodes_completed, average_episode_length, traj_writer, arglist):
     # Save the global state to disk.
     U.save_state(arglist.save_dir, global_step=episodes_completed, saver=saver)
     # Print results for the previous period.
@@ -374,6 +406,7 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
     # Track whether lemol is being used as this has implications for data
     # storage and processing downstream.
     using_lemol = False
+    using_ppo = False
     # Take a copy of the arguments to avoid any possible side effects.
     args = deepcopy(arglist)
     # First set up bad agents.
@@ -400,13 +433,25 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
                     lstm_state_size=arglist.lstm_hidden_dim,
                     lf_dim=arglist.learning_feature_dim
                 ))
+            elif 'ppo' in policy_name.lower():
+                using_ppo = True
+                bad_policies.append(PPOAgentTrainer(
+                    obs_space_n=env.observation_space,
+                    act_space_n=env.action_space,
+                    name='{}-{}_agent_{}'.format(policy_name, 'bad', i),
+                    # again all good agents share agent index across types
+                    # as they will not play alongside each other
+                    agent_index=i,
+                    args=args,
+                    policy_name=policy_name
+                ))
             else:
                 # Set up a version of maddpg or m3ddpg using the original source code provided
                 # alongside that paper.
                 bad_policies.append(MADDPGAgentTrainer(
                     '{}-{}_agent_{}'.format(
                         policy_name, 'bad', i), mlp_model, obs_shape_n, env.action_space, i, arglist,
-                    policy_name == 'ddpg', policy_name, policy_name == 'mmmaddpg'))
+                        policy_name == 'ddpg', policy_name, policy_name == 'mmmaddpg'))
     # Any players that aren't adversaries must be good agents. We now generate these.
     for i in range(num_adversaries, env.n):
         print('{} good agents'.format(i))
@@ -429,6 +474,18 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
                     lstm_state_size=arglist.lstm_hidden_dim,
                     lf_dim=arglist.learning_feature_dim
                 ))
+            elif 'ppo' in policy_name.lower():
+                using_ppo = True
+                good_policies.append(PPOAgentTrainer(
+                    obs_space_n=env.observation_space,
+                    act_space_n=env.action_space,
+                    name='{}-{}_agent_{}'.format(policy_name, 'good', i),
+                    # again all good agents share agent index across types
+                    # as they will not play alongside each other
+                    agent_index=i,
+                    args=args,
+                    policy_name=policy_name
+                ))
             else:
                 # Instantiate a version of maddpg or m3ddpg as per the original m3ddpg paper.
                 good_policies.append(MADDPGAgentTrainer(
@@ -436,7 +493,7 @@ def get_trainers(env, num_adversaries, obs_shape_n, arglist):
                         policy_name, 'good', i), mlp_model, obs_shape_n, env.action_space, i, arglist,
                     policy_name == 'ddpg', policy_name, policy_name == 'mmmaddpg'))
     # We provide separate lists of good and bad agents for ease of manipulation later.
-    return good_policies, bad_policies, using_lemol
+    return good_policies, bad_policies, using_lemol, using_ppo
 
 
 def get_current_pairing(vary_bad, vary_good, bad_policies, good_policies, current_round, arglist):
@@ -476,7 +533,13 @@ def get_current_pairing(vary_bad, vary_good, bad_policies, good_policies, curren
     else:
         lemol_index = None
         lemol_agent = None
-    return current_pairing, lemol_agent, lemol_index
+    if good_policy_name == 'ppo':
+        ppo_index = 1
+    elif bad_policy_name == 'ppo':
+        ppo_index = 0
+    else:
+        ppo_index = None
+    return current_pairing, lemol_agent, lemol_index, ppo_index
 
 
 def which_agents_vary(good_agents, bad_agents):
@@ -532,7 +595,7 @@ def make_agent_type_summaries(agents, summary_of):
     return placeholders, summaries
 
 
-def set_up_tensorboard_summaries(all_agents, using_lemol):
+def set_up_tensorboard_summaries(all_agents, using_lemol, using_ppo):
     # Use the previously defined function for making placeholders
     # and summaries for particular values (make_agent_type_summaries)
     # to set up all we need.
@@ -580,18 +643,43 @@ def set_up_tensorboard_summaries(all_agents, using_lemol):
         summaries['lemol_in_play'] = tf.summary.merge(
             [summaries['lemol_ip_acc'], summaries['lemol_ip_xent']]
         )
+    if using_ppo:
+        v_loss_placeholders, v_loss_summaries = make_agent_type_summaries(
+            all_agents, 'v_loss')
+        kl_placeholders, kl_summaries = make_agent_type_summaries(
+            all_agents, 'kl')
+        summaries['v_loss'] = v_loss_summaries
+        summaries['kl'] = kl_summaries
+        placeholders['v_loss'] = v_loss_placeholders
+        placeholders['kl'] = kl_placeholders
+
     return placeholders, summaries
 
 
-def build_summary_for_current_pair(summaries, current_pairing):
+def build_summary_for_current_pair(summaries, current_pairing, ppo_agent_index=None):
     # Merge the summaries to be run together into one op for ease.
-    per_step_summaries = tf.summary.merge(
-        [summaries['reward'][a.name.split('_')[0]] for a in current_pairing]
-        + [summaries['pg_loss'][a.name.split('_')[0]] for a in current_pairing]
-        + [summaries['q_loss'][a.name.split('_')[0]] for a in current_pairing]
-        + [summaries['q_value'][a.name.split('_')[0]] for a in current_pairing]
-        + [summaries['target_q_value'][a.name.split('_')[0]] for a in current_pairing]
-    )
+    if ppo_agent_index is None:
+        per_step_summaries = tf.summary.merge(
+            [summaries['reward'][a.name.split('_')[0]] for a in current_pairing]
+            + [summaries['pg_loss'][a.name.split('_')[0]] for a in current_pairing]
+            + [summaries['q_loss'][a.name.split('_')[0]] for a in current_pairing]
+            + [summaries['q_value'][a.name.split('_')[0]] for a in current_pairing]
+            + [summaries['target_q_value'][a.name.split('_')[0]] for a in current_pairing]
+        )
+    else:
+        ppo_name = current_pairing[ppo_agent_index].name.split('_')[0]
+        oa_name = current_pairing[1-ppo_agent_index].name.split('_')[0]
+        per_step_summaries = tf.summary.merge([
+            summaries['reward'][oa_name],
+            summaries['pg_loss'][oa_name],
+            summaries['q_loss'][oa_name],
+            summaries['q_value'][oa_name],
+            summaries['target_q_value'][oa_name],
+            summaries['pg_loss'][ppo_name],
+            summaries['v_loss'][ppo_name],
+            summaries['kl'][ppo_name],
+            summaries['reward'][ppo_name]
+        ])
     # The average reward summary is run less frequently and so is kept separate.
     avg_r_summary = tf.summary.merge(
         [summaries['avg_r'][a.name.split('_')[0]] for a in current_pairing])
@@ -599,34 +687,41 @@ def build_summary_for_current_pair(summaries, current_pairing):
 
 
 def do_in_play_logging(
-    summary_feeds, all_values, current_pairing, train_step, traj_writer, gen_writer,
-    lemol_agent_index, lemol_ip_log_freq, general_summaries, lemol_ip_summaries):
+        summary_feeds, all_values, current_pairing, train_step, traj_writer, gen_writer,
+        lemol_agent_index, lemol_ip_log_freq, general_summaries, lemol_ip_summaries,
+        ppo_index=None):
     sess = U.get_session()
-    # Collect only the values we need from those collected in training.
-    # This comprehension puts them together in one list with agent 0s
-    # data first and then agent 1s data at the end.
-    values = [value for vs in all_values for value in vs[:5]]
-    # We now build up a list of placeholders in the same order
-    # as the data provided so that we can feed data through to
-    # the summary operations.
-    placeholders = []
-    for agent in current_pairing:
-        placeholders.append(
-            summary_feeds['q_loss'][agent.name.split('_')[0]])
-        placeholders.append(
-            summary_feeds['pg_loss'][agent.name.split('_')[0]])
-        placeholders.append(
-            summary_feeds['q_value'][agent.name.split('_')[0]])
-        placeholders.append(
-            summary_feeds['target_q_value'][agent.name.split('_')[0]])
-        placeholders.append(
-            summary_feeds['reward'][agent.name.split('_')[0]])
+    if ppo_index is not None:
+        do_in_play_logging_with_ppo(
+            summary_feeds, all_values, current_pairing, train_step, traj_writer,
+            gen_writer, lemol_agent_index, lemol_ip_log_freq, general_summaries,
+            lemol_ip_summaries, ppo_index, sess)
+    else:
+        # Collect only the values we need from those collected in training.
+        # This comprehension puts them together in one list with agent 0s
+        # data first and then agent 1s data at the end.
+        values = [value for vs in all_values for value in vs[:5]]
+        # We now build up a list of placeholders in the same order
+        # as the data provided so that we can feed data through to
+        # the summary operations.
+        placeholders = []
+        for agent in current_pairing:
+            placeholders.append(
+                summary_feeds['q_loss'][agent.name.split('_')[0]])
+            placeholders.append(
+                summary_feeds['pg_loss'][agent.name.split('_')[0]])
+            placeholders.append(
+                summary_feeds['q_value'][agent.name.split('_')[0]])
+            placeholders.append(
+                summary_feeds['target_q_value'][agent.name.split('_')[0]])
+            placeholders.append(
+                summary_feeds['reward'][agent.name.split('_')[0]])
 
-    # Prepare the data for feeding in to tf.
-    # Then run the summary operations and log the result.
-    feed_dict = dict(zip(placeholders, values))
-    s = sess.run(general_summaries, feed_dict)
-    traj_writer.add_summary(s, train_step)
+        # Prepare the data for feeding in to tf.
+        # Then run the summary operations and log the result.
+        feed_dict = dict(zip(placeholders, values))
+        s = sess.run(general_summaries, feed_dict)
+        traj_writer.add_summary(s, train_step)
 
     # If we have a lemol agent and it is the right time step
     # we log in play opponent model performance metrics.
@@ -638,10 +733,10 @@ def do_in_play_logging(
         # and log the results.
         if acc_value is not None and xent_value is not None:
             s = sess.run(lemol_ip_summaries,
-                            {
-                                summary_feeds['lemol_ip_acc']: acc_value,
-                                summary_feeds['lemol_ip_xent']: xent_value
-                            })
+                         {
+                             summary_feeds['lemol_ip_acc']: acc_value,
+                             summary_feeds['lemol_ip_xent']: xent_value
+                         })
             gen_writer.add_summary(s, train_step)
 
 
@@ -655,9 +750,10 @@ def get_lemol_om_pred(current_pairing, action_n, obs_n, h, c, episode_step, epis
         # If we are in the region where we want to feed true actions to
         # LeMOL then we feed the true action to LeMOL with probability
         # given by arglist.lemol_true_action_feed_proportion
-        if ((episode_step < arglist.feed_lemol_true_action_before or
+        if (((episode_step < arglist.feed_lemol_true_action_before or
             episode_step > arglist.feed_lemol_true_action_after) and
-                np.random.uniform() < arglist.lemol_true_action_feed_proportion):
+                np.random.uniform() < arglist.lemol_true_action_feed_proportion) or 
+                np.random.uniform() < arglist.lemol_oracle_baseline_acc):
             if arglist.discrete_actions:
                 # If we are working with discrete actions we need to form
                 # a one hot encoding of the opponent's action.
@@ -681,44 +777,31 @@ def get_lemol_om_pred(current_pairing, action_n, obs_n, h, c, episode_step, epis
         # We are using LeMOL's opponent model.
         # Work out which agent is LeMOL
         lemol_agent = current_pairing[lemol_agent_index]
-        if len(lemol_agent.replay_buffer) > lemol_agent.exploration_steps:
-            # If initial exploration is complete then we get the prediction
-            # from the opponent model.
-            # This may first require updating the learning feature through
-            # the LSTM.
-            if update_lf:
-                h, c = lemol_agent.om_step(
-                    episode_events, episode_obs, h, c, use_initial_lf_state)
-                # Once learning features have started being used we no longer
-                # use the initial state.
-                use_initial_lf_state = False
-            # Given the learning feature calculated from history we can perform
-            # opponent action prediction.
-            if arglist.recurrent_om_prediction:
-                om_pred, in_ep_h, in_ep_c = lemol_agent.om_act(
-                    obs_n[lemol_agent_index][None][None], h, c, use_initial_lf_state,
-                    in_ep_h, in_ep_c, episode_step==0
-                )
-            else:
-                om_pred = lemol_agent.om_act(
-                    obs_n[lemol_agent_index][None][None], h, c, use_initial_lf_state
-                )
-            if arglist.discrete_actions:
-                z = np.zeros_like(om_pred)
-                z[np.argmax(om_pred)] = 1
-                om_pred = z
+        # If initial exploration is complete then we get the prediction
+        # from the opponent model.
+        # This may first require updating the learning feature through
+        # the LSTM.
+        if update_lf and len(lemol_agent.replay_buffer) > lemol_agent.exploration_steps:
+            h, c = lemol_agent.om_step(
+                episode_events, episode_obs, h, c, use_initial_lf_state)
+            # Once learning features have started being used we no longer
+            # use the initial state.
+            use_initial_lf_state = False
+        # Given the learning feature calculated from history we can perform
+        # opponent action prediction.
+        if arglist.recurrent_om_prediction:
+            om_pred, in_ep_h, in_ep_c = lemol_agent.om_act(
+                obs_n[lemol_agent_index][None][None], h, use_initial_lf_state,
+                in_ep_h, in_ep_c, episode_step==0
+            )
         else:
-            # We are still exploring and do not wish to update the LSTM state.
-            # We further do not wish to provide random noise as in such a case
-            # we encourage LeMOL to ignore the opponent model if this data is
-            # then used for training. We therefore pass in the true opponent's
-            # action which is itself noise but it is useful as it is the noise
-            # that the opponent is executing.
-            if arglist.discrete_actions:
-                om_pred = np.zeros(opp_act_dim)
-                om_pred[np.argmax(action_n[1 - lemol_agent_index])] = 1.0
-            else:
-                om_pred = action_n[1-lemol_agent_index]
+            om_pred = lemol_agent.om_act(
+                obs_n[lemol_agent_index][None][None], h, use_initial_lf_state
+            )
+        if arglist.discrete_actions:
+            z = np.zeros_like(om_pred)
+            z[np.argmax(om_pred)] = 1
+            om_pred = z
     if arglist.recurrent_om_prediction:
         return om_pred, h, c, use_initial_lf_state, in_ep_h, in_ep_c
     else:
@@ -728,21 +811,29 @@ def get_lemol_om_pred(current_pairing, action_n, obs_n, h, c, episode_step, epis
 def collect_experience(
     current_pairing, observations, actions, rewards, dones, terminal, next_observations,
     train_step, general_writer, arglist, initial_step=False, om_pred=None, h=None, c=None,
-    policy_distributions=None):
+    policy_distributions=None, h_in_ep_prev=None, c_in_ep_prev=None, h_in_ep=None, c_in_ep=None,
+    ppo_v=None, ppo_logp=None):
     # For each agent let them experience the current time step (adding it to
     # their respective replay buffers).
     # LeMOL agents are treated separately as they require more data than other agents.
     for i, agent in enumerate(current_pairing):
         if isinstance(agent, LeMOLAgentTrainer):
             # Pass all relevant data to LeMOL
+            # h_in_ep and c_in_ep are only relevant for a recurrent OM. If they are
+            # None they will be ignored in experience collection.
             agent.experience(observations[i], actions[i], rewards[i], next_observations[i],
                 dones[i], terminal, om_pred, h, c, actions[1-i], policy_distributions[i],
-                policy_distributions[i-1], initial_step)
+                policy_distributions[i-1], initial_step, h_in_ep_prev, c_in_ep_prev,
+                h_in_ep, c_in_ep)
             # As a debugging step we allow the gradient of the action on the opponent prediction
             # to be logged.
             if arglist.log_om_influence and (train_step % arglist.log_om_influence_freq == 0):
                 agent.log_om_influence(
                     observations[i], np.squeeze(om_pred), general_writer, train_step)
+        elif isinstance(agent, PPOAgentTrainer):
+            agent.experience(
+                observations[i], actions[i], rewards[i], next_observations[i],
+                dones[i], terminal, ppo_v, ppo_logp)
         else:
             # We have an MADDPG-based agent which requires data as below.
             agent.experience(
@@ -750,7 +841,7 @@ def collect_experience(
 
 
 def train(arglist):
-    # If required set the random seed for reproducable tests
+    # If required set the random seed for reproduceable tests
     if arglist.test:
         np.random.seed(71)
     # Set up a session.
@@ -763,7 +854,7 @@ def train(arglist):
 
         # Set up agents for all potential rounds of training.
         # We also work out whether or not lemol agents are being used.
-        good_policies, bad_policies, using_lemol = get_trainers(
+        good_policies, bad_policies, using_lemol, using_ppo = get_trainers(
             env, num_adversaries, obs_shape_n, arglist)
 
         # Work out whether we are rotating through different types
@@ -778,7 +869,8 @@ def train(arglist):
         # and their related placeholders
         general_summary_writer = tf.summary.FileWriter(os.path.join(
             arglist.log_dir, 'LeMOL_Opponent_Modelling'))
-        summary_feeds, summary_targets = set_up_tensorboard_summaries(trainers, using_lemol)
+        summary_feeds, summary_targets = set_up_tensorboard_summaries(
+            trainers, using_lemol, using_ppo)
 
         # Initialise all variables across all agents (not just the first pairing)
         U.initialize()
@@ -801,12 +893,14 @@ def train(arglist):
                 for j in range(max(len(good_policies), len(bad_policies))):
                     # Attain the current pairing of agents to play 1 v 1 based
                     # on the indices in the loops above.
-                    current_pairing, lemol_agent, lemol_agent_index = get_current_pairing(
+                    current_pairing, lemol_agent, lemol_agent_index, ppo_agent_index = get_current_pairing(
                         vary_bad, vary_good, bad_policies, good_policies, j, arglist)
 
                     # Since we only run two agents at a time we need to set up the summary operations
                     # for each pair as they are cycled through.
-                    per_step_summaries, avg_r_summary = build_summary_for_current_pair(summary_targets, current_pairing)
+                    per_step_summaries, avg_r_summary = build_summary_for_current_pair(
+                        summary_targets, current_pairing, ppo_agent_index
+                    )
 
                     print('Using good policy {} and bad policy {} with {} adversaries'.format(
                         current_pairing[1].name.split('_')[0], current_pairing[0].name.split('_')[0], num_adversaries))
@@ -829,23 +923,33 @@ def train(arglist):
                     episode_rewards = [0.0 for _ in range(arglist.num_episodes)]  # sum of rewards for all agents
                     episodes_completed = 0
                     average_episode_length = 0
-                    agent_rewards = [[0.0 for _ in range(arglist.num_episodes)] for __ in range(env.n)] # individual agent reward
-                    final_ep_rewards = [None for _ in range(arglist.num_episodes//arglist.save_rate)]  # sum of rewards for training curve
-                    final_ep_ag_rewards = [None for _ in range(arglist.num_episodes//arglist.save_rate)]  # agent rewards for training curve
-                    agent_info = [[[], []] for _ in range(arglist.num_episodes)] # placeholder for benchmarking info
+                    agent_rewards = [[0.0 for _ in range(arglist.num_episodes)]
+                                     for __ in range(env.n)]  # individual agent reward
+                    # sum of rewards for training curve
+                    final_ep_rewards = [None for _ in range(arglist.num_episodes//arglist.save_rate)]
+                    # agent rewards for training curve
+                    final_ep_ag_rewards = [None for _ in range(arglist.num_episodes//arglist.save_rate)]
+                    agent_info = [[[], []] for _ in range(arglist.num_episodes)]  # placeholder for benchmarking info
                     # Initialise lemol stuff for later opponent model updating.
                     om_pred = None
-                    if arglist.recurrent_om_prediction:
-                        in_ep_h = np.zeros((1, arglist.in_ep_lstm_dim))
-                        in_ep_c = np.zeros_like(in_ep_h)
-                    h = np.zeros((1, lemol_agent.lstm_hidden_dim))
-                    c = np.zeros_like(h)
-                    agent_update_freq = arglist.agent_update_freq
-                    use_initial_lf_state = True
                     if using_lemol:
-                        # Set up arrays to hold the periodic data needed to update the learning feature LSTM.
+                        use_initial_lf_state = True
+                         # Set up arrays to hold the periodic data needed to update the learning feature LSTM.
                         episode_events = np.zeros((1, arglist.agent_update_freq, lemol_agent.lstm_input_dim))
                         episode_obs = np.zeros((1, arglist.agent_update_freq, lemol_agent.observation_dim))
+                        lemol_agent.reset_lemol_state()
+                        # Set up the recurrent model states
+                        if arglist.recurrent_om_prediction:
+                            # The copying mechanism used to have both old and new states to pass
+                            # to the replay buffer means we need only initialise current states.
+                            in_ep_h, in_ep_c = lemol_agent.initial_in_ep_state
+                        else:
+                            in_ep_h_old, in_ep_c_old, in_ep_h, in_ep_c = None, None, None, None
+                    else:
+                        in_ep_h_old, in_ep_c_old, in_ep_h, in_ep_c = None, None, None, None
+                    h = np.zeros((1, arglist.lstm_hidden_dim))
+                    c = np.zeros_like(h)
+                    agent_update_freq = arglist.agent_update_freq
                     episode_step, train_step, post_exploration_steps = 0, 0, 0 # step counters
                     saver = tf.train.Saver() # Model saving facility
 
@@ -871,21 +975,31 @@ def train(arglist):
                         print('Starting iterations...')
                         while True:
                             # Get Actions for All Agents
+                            ppo_v, ppo_logp = None, None
                             if using_lemol:
                                 # Instantiate a list of actions so that either player can act first.
                                 action_n = [None, None]
                                 # Attain the action for LeMOL's opponent.
                                 # This enables us to do oracle implementations.
                                 # 1 - lemol_agent_index is 1 if lemol is agent 0 and 0 if lemol is agent 1.
-                                action_n[1-lemol_agent_index] = current_pairing[1 -
-                                                                                lemol_agent_index].action(obs_n[1-lemol_agent_index])
+                                opp_idx = 1 - lemol_agent_index
+                                if isinstance(current_pairing[opp_idx], PPOAgentTrainer):
+                                    a, ppo_v, ppo_logp = current_pairing[opp_idx].action(obs_n[opp_idx])
+                                    action_n[opp_idx] = np.squeeze(a)
+                                else:
+                                    action_n[opp_idx] = current_pairing[opp_idx].action(obs_n[opp_idx])
                                 # Attain the opponent model prediction along with possibly updated
                                 # LSTM state variables.
                                 # We update the LSTM once there is enough data after exploration and
                                 # the timing fits with the opponent learning update frequency.
-                                update_lf = (post_exploration_steps >= agent_update_freq 
-                                                and (post_exploration_steps % agent_update_freq) == 0)
+                                update_lf = (post_exploration_steps >= agent_update_freq
+                                             and (post_exploration_steps % agent_update_freq) == 0)
                                 if arglist.recurrent_om_prediction:
+                                    # For Q training we need om_pred and om_pred_next which means we need
+                                    # h[t-t], c[t-1] for the former and h[t] c[t] for the latter. This deep
+                                    # copying lets us keep both around.
+                                    in_ep_h_old = deepcopy(in_ep_h)
+                                    in_ep_c_old = deepcopy(in_ep_c)
                                     om_pred, h, c, use_initial_lf_state, in_ep_h, in_ep_c = get_lemol_om_pred(
                                         current_pairing, action_n, obs_n, h, c,
                                         episode_step, episode_events, episode_obs, lemol_agent_index,
@@ -904,7 +1018,11 @@ def train(arglist):
                                 # and receive an action.
                                 action_n = []
                                 for agent, obs in zip(current_pairing, obs_n):
-                                    action_n.append(agent.action(obs))
+                                    if isinstance(agent, PPOAgentTrainer):
+                                        a, ppo_v, ppo_logp = agent.action(obs)
+                                        action_n.append(np.squeeze(a))
+                                    else:
+                                        action_n.append(agent.action(obs))
                             # environment step
                             # passin a copy of action_n as otherwise this converts it to one hot
                             # (in the case that we force one hot actions). This copy contains the
@@ -920,7 +1038,6 @@ def train(arglist):
                                 # They take in all of the information from the current step
                                 # which will be the previous timestep come opponent model
                                 # prediction time.
-                                # TODO change this later for better initial lstm_input
                                 lstm_input = np.concatenate([
                                     action_n[1-lemol_agent_index],
                                     obs_n[lemol_agent_index],
@@ -930,14 +1047,18 @@ def train(arglist):
                                 ], axis=-1)
                                 # Store/overwrite current events in an array for use in updating the lstm.
                                 episode_events[:, post_exploration_steps % agent_update_freq] = lstm_input.copy()
-                                episode_obs[:, post_exploration_steps % agent_update_freq] = obs_n[lemol_agent_index].copy()
+                                episode_obs[:, post_exploration_steps %
+                                            agent_update_freq] = obs_n[lemol_agent_index].copy()
 
                             # Add experience to replay buffers allowing for possibly different logic
                             # for the very first step of the run.
-                            initial = post_exploration_steps == 0 and lemol_agent.initial_exploration_done
+                            initial = (post_exploration_steps == 0 and
+                                       all([a.initial_exploration_done for a in current_pairing]))
                             collect_experience(
                                 current_pairing, obs_n, action_n, rew_n, done_n, terminal, new_obs_n,
-                                train_step, general_summary_writer, arglist, initial, om_pred, h, c, policy_distributions)
+                                train_step, general_summary_writer, arglist, initial, om_pred, h, c,
+                                policy_distributions, in_ep_h_old, in_ep_c_old, in_ep_h, in_ep_c,
+                                ppo_v, ppo_logp)
 
                             # Accumulate rewards as appropriate.
                             for i, rew in enumerate(rew_n):
@@ -952,14 +1073,19 @@ def train(arglist):
                                 average_episode_length = ratio * average_episode_length + episode_step/episodes_completed
                                 obs_n = env.reset()
                                 episode_step = 0
+                                if using_lemol and arglist.recurrent_om_prediction:
+                                    # Reset the in episode LSTM at the end of each episode.
+                                    in_ep_h, in_ep_c = lemol_agent.initial_in_ep_state
                             else:
                                 # Update the observations
                                 obs_n = new_obs_n
 
                             # for benchmarking learned policies
                             # TODO test benchmarking code
-                            agent_info, end = benchmark_and_end(agent_info, info_n, train_step, done, terminal, episodes_completed, arglist)
-                            if end: break
+                            agent_info, end = benchmark_and_end(
+                                agent_info, info_n, train_step, done, terminal, episodes_completed, arglist)
+                            if end:
+                                break
 
                             # for displaying learned policies
                             if arglist.display:
@@ -995,7 +1121,8 @@ def train(arglist):
                                         lemol_agent_index,
                                         arglist.lemol_in_play_perf_log_freq,
                                         per_step_summaries,
-                                        summary_targets.get('lemol_in_play')
+                                        summary_targets.get('lemol_in_play'),
+                                        ppo_agent_index
                                     )
 
                             # save model, display training output
@@ -1006,7 +1133,7 @@ def train(arglist):
                                     avg_r_summary, episodes_completed, average_episode_length, file_writer, arglist
                                 )
                             if finish_trajectory(arglist, episodes_completed, final_ep_rewards,
-                                                      final_ep_ag_rewards, current_pairing, k, outer_iter):
+                                                 final_ep_ag_rewards, current_pairing, k, outer_iter):
                                 break
                             # Reset the timer for the next section of training.
                             t_start = time.time()
@@ -1014,7 +1141,7 @@ def train(arglist):
                             # increment global step counter and one which updates only
                             # after exploration is complete.
                             train_step += 1
-                            if lemol_agent.initial_exploration_done:
+                            if all([a.initial_exploration_done for a in current_pairing]):
                                 post_exploration_steps += 1
 
             if arglist.skip_to_om_training_first_cycle:
@@ -1022,9 +1149,7 @@ def train(arglist):
             # If we have a LeMOL Opponent model that is being used. Train it.
             if using_lemol and not arglist.feed_lemol_true_action:
                 print('Starting LeMOL Opponent Model Training')
-                # Set up the path to the data.
-                data_dir = '/'.join(arglist.lemol_save_path.split('/')
-                                    [:2]) + '/'
+                data_dir = arglist.lemol_save_path
                 for _ in range(arglist.om_training_iters):
                     # Train for as many iterations as requested by the user.
                     lemol_agent.train_opponent_model(

@@ -10,14 +10,15 @@ import multiagentrl.common.tf_util as U
 from multiagentrl.common.distributions import make_pdtype, SoftMultiCategoricalPd
 from multiagentrl.common.agent_trainer import AgentTrainer
 from multiagentrl.common.replay_buffer import LeMOLReplayBuffer
-from .lemol_framework import get_lstm_for_lemol
+from .lemol_framework import get_lstm_for_lemol, build_triplet_loss
 from .lemol_block_processing import om_train_block_processing
 
 
 def om_train(
         lstm_inputs, observations_ph, lstm, action_pred_func, opp_act_space,
         num_units, lstm_hidden_dim, optimizer, scope, episode_len=None,
-        history_embedding_dim=None, grad_norm_clipping=None, reuse=None):
+        history_embedding_dim=None, grad_norm_clipping=None, ablate_lstm=False,
+        reuse=None, use_representation_loss=False, positive_dist=5, negative_dist=40):
     with tf.variable_scope(scope, reuse=reuse):
         # ----------------------------------- SET UP -----------------------------------
         # Set up the opponent policy being modelled as a distribution.
@@ -65,24 +66,35 @@ def om_train(
         # consistently across the custom LeMOL LSTM and standard LSTM
         # implementations. Note that this essentially makes the custom
         # LSTM run like standard implementations.
-        # TODO Analyse and decide whether to persevere with custom LSTM.
         hidden_activations, final_h, final_c = lstm(
             lstm_inputs, initial_state=[h, c])[:3]
+
+        # If we are using a representation loss we build it using the function
+        # defined in the framework file.
+        if use_representation_loss:
+            representation_loss_weight = tf.placeholder(tf.float32, (), 'representation_loss_weight')
+            all_h = tf.concat([tf.expand_dims(h, 1), hidden_activations], axis=1)
+            representation_loss = build_triplet_loss(all_h, positive_dist, negative_dist)
         # --------------------------- END OF META MODELLING ---------------------------
 
         # ----------------------------- ACTION PREDICTION -----------------------------
         # Initial logic to allow running the LSTM to update learning features or simply
         # pass in previously calculated values.
+        # We use the lagged output from the LSTM because in training we try to predict
+        # the current opponent action and therefore must use the learning feature from
+        # before the current opponent action is known.
         run_lstm = tf.placeholder(tf.bool, shape=(), name='om_training_boolean')
         learning_features = tf.cond(
             run_lstm,
-            lambda: hidden_activations,
+            lambda: tf.concat([tf.expand_dims(h, 1), hidden_activations[:, :-1]], axis=1),
             lambda: tf.tile(tf.expand_dims(h, 1), (1, tf.shape(observations_ph)[1], 1))
         )
         # We model the opponent's action using the current observation and the modelled
         # learning process feature. Action prediction itself then only considers the
         # context of history through the 'meta modelling' LSTM.
         opp_policy_input = tf.concat([observations_ph, learning_features], axis=-1)
+        if ablate_lstm:
+            opp_policy_input = observations_ph
         # Use the function passed in to attain logits for the estimated opponent policy.
         # This passed in function is generally a multi-layered perceptron.
         om_logits = action_pred_func(opp_policy_input, scope='action_pred_func',
@@ -100,10 +112,11 @@ def om_train(
 
         # ----------------------------------- TRAINING -----------------------------------
         # Collect weights to train from the LSTM (inc. the initial state) and the action
-        # prediction function. They are all trained together.
-        om_vars = lstm.weights
-        om_vars += [initial_h, initial_c]
-        om_vars += U.scope_vars(U.absolute_scope_name('action_pred_func'))
+        # prediction function. They are all trained together where relevant.
+        om_vars = U.scope_vars(U.absolute_scope_name('action_pred_func'))
+        if not ablate_lstm:
+            om_vars += lstm.weights
+            om_vars += [initial_h, initial_c]
 
         # Loss calculation.
         # We require target values - the true actions we wish to predict.
@@ -115,6 +128,8 @@ def om_train(
             labels=target_ph,
             logits=om_logits
         ))
+        if use_representation_loss:
+            loss += representation_loss_weight * representation_loss
 
         # Finally for training, set up an update function for the loss, minimised over the
         # variables of the opponent model (as collected above).
@@ -160,8 +175,8 @@ def om_train(
             outputs=om_logits
         )
 
-        def logits(o, h, c, init):
-            return logits_full(np.zeros((1, 1, int(lstm_inputs.shape[-1]))), o, h, c, init, False)
+        def logits(o, h, init=False):
+            return logits_full(np.zeros((o.shape[0], 1, int(lstm_inputs.shape[-1]))), o, h, np.zeros_like(h), init, False)
 
         # act provides and access to the estimated opponent action.
         act_full = U.function(
@@ -169,8 +184,8 @@ def om_train(
             outputs=action_deter
         )
 
-        def act(o, h, c, init):
-            return act_full(np.zeros((1, 1, int(lstm_inputs.shape[-1]))), o, h, c, init, False)
+        def act(o, h, init=False):
+            return act_full(np.zeros((o.shape[0], 1, int(lstm_inputs.shape[-1]))), o, h, np.zeros_like(h), init, False)
 
         # Provide a simple interface to train the model.
         # This function updates the weights of the opponent model returning
@@ -186,15 +201,21 @@ def om_train(
         # ignored but must still be passed in as all possible computation paths
         # through the graph must be passed in since boolean conditions are evaluated
         # lazily and inputs validated greedily.
+        train_inputs = [lstm_inputs, observations_ph, target_ph, h_ph, c_ph,
+                        use_initial_state, run_lstm]
+        if use_representation_loss:
+            train_inputs += [representation_loss_weight]
         train_full = U.function(
-            inputs=[lstm_inputs, observations_ph,
-                    target_ph, h_ph, c_ph, use_initial_state, run_lstm],
+            inputs=train_inputs,
             outputs=[loss, training_summaries, final_h, final_c],
             updates=[optimize_expr]
         )
 
-        def train(i, o, t, h, c, init):
-            return train_full(i, o, t, h, c, init, True)
+        def train(i, o, t, h, c, init, w=0):
+            if use_representation_loss:
+                return train_full(i, o, t, h, c, init, True, w)
+            else:
+                return train_full(i, o, t, h, c, init, True)
         # --------------------------------- END FUNCTION BUILDING ---------------------------------
 
         return act, step, train, {'logits': logits, 'initial_h': initial_h, 'initial_c': initial_c}
@@ -202,7 +223,8 @@ def om_train(
 
 def p_train(
         obs_ph_n, opp_act_ph, act_space_n, p_index, p_func, q_func, optimizer,
-        grad_norm_clipping=None, num_units=64, scope='trainer', reuse=None, polyak=1e-4):
+        grad_norm_clipping=None, num_units=64, scope='trainer', reuse=None, polyak=1e-4,
+        decentralised_obs=False):
     # p_index is the agent index.
     with tf.variable_scope(scope, reuse=reuse):
         # create action distributions
@@ -235,7 +257,10 @@ def p_train(
         act_input_n[p_index] = act_sample
 
         # Centralised q function takes in all observations and all actions.
-        q_input = tf.concat(obs_ph_n + act_input_n, 1)
+        if decentralised_obs:
+            q_input = tf.concat([obs_ph_n[p_index]] + act_input_n, 1)
+        else:
+            q_input = tf.concat(obs_ph_n + act_input_n, 1)
 
         # Attain q values
         q = q_func(q_input, 1, scope='q_func',
@@ -299,7 +324,8 @@ def p_train(
 
 def q_train(
         obs_ph_n, act_space_n, q_index, q_func, optimizer, grad_norm_clipping=None,
-        scope='trainer', reuse=None, num_units=64, polyak=1e-4):
+        scope='trainer', reuse=None, num_units=64, polyak=1e-4,
+        decentralised_obs=False):
     '''
     Arguments
     make_obs_ph_n
@@ -317,8 +343,12 @@ def q_train(
             [None], name='action'+str(i)) for i in range(len(act_space_n))]
         target_ph = tf.placeholder(tf.float32, [None], name='target')
 
-        # Collect all observations and actions together for centralised training.
-        q_input = tf.concat(obs_ph_n + act_ph_n, 1)
+        # Collect all observations and actions together if performing
+        # centralised training.
+        if decentralised_obs:
+            q_input = tf.concat([obs_ph_n[q_index]] + act_ph_n, 1)
+        else:
+            q_input = tf.concat(obs_ph_n + act_ph_n, 1)
 
         # The q value for the state-action pair.
         q = tf.squeeze(q_func(q_input, 1, scope='q_func', num_units=num_units))
@@ -363,6 +393,7 @@ class LeMOLAgentTrainer(AgentTrainer):
         self.lstm_hidden_dim = lstm_state_size
         self.update_freq = args.agent_update_freq
         self.initial_exploration_done = False
+        self.recurrent_om = args.recurrent_om_prediction
         self.args = args
         obs_ph_n = []
         for i in range(self._num_agents):
@@ -379,7 +410,7 @@ class LeMOLAgentTrainer(AgentTrainer):
             sum([act_s.n for act_s in act_space_n]) + reward_dim + done_dim
         self.lstm_input_dim = event_dim
         om_lstm = get_lstm_for_lemol(
-            use_standard_lstm=self.args.use_standard_lstm,
+            use_standard_lstm=not self.args.use_alternative_lstm,
             lstm_state_size=self.lstm_hidden_dim,
             lstm_input_dim=self.lstm_input_dim,
             act_space_n=act_space_n,
@@ -401,7 +432,8 @@ class LeMOLAgentTrainer(AgentTrainer):
             optimizer=tf.train.AdamOptimizer(learning_rate=args.lr),
             grad_norm_clipping=0.5,
             num_units=args.num_units,
-            polyak=args.polyak
+            polyak=args.polyak,
+            decentralised_obs=args.decentralise_lemol_obs
         )
         self.act, self.p_train, self.target_p_update, self.p_vars, self.p_debug = p_train(
             scope=self.scope,
@@ -414,7 +446,8 @@ class LeMOLAgentTrainer(AgentTrainer):
             optimizer=tf.train.AdamOptimizer(learning_rate=args.lr),
             grad_norm_clipping=0.5,
             num_units=args.num_units,
-            polyak=args.polyak
+            polyak=args.polyak,
+            decentralised_obs=args.decentralise_lemol_obs
         )
         # Get the correct set up regarding doing block processing or otherwise.
         if args.block_processing:
@@ -430,9 +463,16 @@ class LeMOLAgentTrainer(AgentTrainer):
                 scope=self.scope,
                 update_period_len=args.agent_update_freq,
                 history_embedding_dim=args.episode_embedding_dim,
-                recurrent_prediction_module=args.recurrent_om_prediction,
-                recurrent_prediction_dim=args.in_ep_lstm_dim
+                recurrent_prediction_module=self.recurrent_om,
+                recurrent_prediction_dim=args.in_ep_lstm_dim,
+                ablate_lstm=args.ablate_lemol_lstm,
+                use_representation_loss=args.use_triplet_representation_loss,
+                positive_dist=args.rep_loss_pos_dist,
+                negative_dist=args.rep_loss_neg_dist
             )
+            if self.recurrent_om:
+                # We need an initial in-episode state if we have a recurrent OM.
+                self._initial_in_ep_state = None
         else:
             self.om_act, self.get_om_outputs, self.om_train, self.om_debug = om_train(
                 lstm_inputs=lstm_input_ph,
@@ -443,7 +483,11 @@ class LeMOLAgentTrainer(AgentTrainer):
                 num_units=args.num_units,
                 lstm_hidden_dim=self.lstm_hidden_dim,
                 optimizer=tf.train.AdamOptimizer(learning_rate=args.omlr),
-                scope=self.scope
+                scope=self.scope,
+                ablate_lstm=args.ablate_lemol_lstm,
+                use_representation_loss=args.use_triplet_representation_loss,
+                positive_dist=args.rep_loss_pos_dist,
+                negative_dist=args.rep_loss_neg_dist
             )
         # Create experience buffer
         self.replay_buffer = LeMOLReplayBuffer(
@@ -454,6 +498,10 @@ class LeMOLAgentTrainer(AgentTrainer):
         self.exploration_steps = args.batch_size * args.max_episode_len
         self.policy_name = policy_name
         self.act_space_n = act_space_n
+        # Store the latest LeMOL learning feature LSTM state so that
+        # calls to OM act can be make using the latest opponent
+        # representation.
+        self.current_h, self.current_c = None, None
 
     def reset_p_and_q_networks(self):
         self.initial_exploration_done = False
@@ -464,13 +512,14 @@ class LeMOLAgentTrainer(AgentTrainer):
                 'policy_name': self.policy_name}
 
     def set_save_dir(self, opponent_index, lemol_om_iter, traj_num, arglist):
+        path = os.path.join(arglist.lemol_save_path, '{}_vs_{}/OM{}/{}.npz')
         if self.agent_index == 0:
-            new_path = arglist.lemol_save_path.format(
+            new_path = path.format(
                 arglist.bad_policy, arglist.good_policy.split(
                     '_')[opponent_index], lemol_om_iter, traj_num
             )
         else:
-            new_path = arglist.lemol_save_path.format(
+            new_path = path.format(
                 arglist.bad_policy.split(
                     '_')[opponent_index], arglist.good_policy, lemol_om_iter, traj_num
             )
@@ -485,16 +534,24 @@ class LeMOLAgentTrainer(AgentTrainer):
             # Get the initial state.
             # Not strictly needed as use_initial_lf_state should handle this.
             h, c = U.get_session().run([self.om_debug['initial_h'], self.om_debug['initial_c']])
-        return self.get_om_outputs(om_inputs, obs, h, c, use_initial_lf_state)
+        om_outputs = self.get_om_outputs(om_inputs, obs, h, c, use_initial_lf_state)
+        # Update the current LeMOL state which denotes the representation
+        # of the opponent.
+        self.current_h, self.current_c = om_outputs
+        return om_outputs
 
-    def experience(self, obs, act, rew, new_obs, done, terminal, om_pred, h, c, opp_act, policy, opp_policy, initial):
+    def reset_lemol_state(self):
+        self.current_h, self.current_c = U.get_session().run([self.om_debug['initial_h'], self.om_debug['initial_c']])
+
+    def experience(self, obs, act, rew, new_obs, done, terminal, om_pred, h, c, opp_act, policy,
+                   opp_policy, initial, h_in_ep_prev=None, c_in_ep_prev=None, h_in_ep=None, c_in_ep=None):
         # Ensure that we have an appropriate state to sample
         if initial:
             h, c = U.get_session().run([self.om_debug['initial_h'], self.om_debug['initial_c']])
         # Store transition in the replay buffer.
-        self.replay_buffer.add(obs, act, rew, new_obs,
-                               float(terminal or done), np.squeeze(om_pred), h, c,
-                               opp_act, policy, opp_policy)
+        self.replay_buffer.add(obs, act, rew, new_obs, float(terminal or done), np.squeeze(om_pred),
+                               h, c, opp_act, policy, opp_policy, h_in_ep_prev, c_in_ep_prev,
+                               h_in_ep, c_in_ep)
 
     def preupdate(self):
         pass
@@ -526,8 +583,8 @@ class LeMOLAgentTrainer(AgentTrainer):
         # This also collects the opponent model prediction.
         for i in range(self._num_agents):
             if i == lemol_index:
-                obs, act, rew, obs_next, done, om_pred, _, _ = agents[i].replay_buffer.sample_index(
-                    index)
+                obs, act, rew, obs_next, done = agents[i].replay_buffer.sample_index(
+                    index)[:5]
             else:
                 obs, act, rew, obs_next, done = agents[i].replay_buffer.sample_index(index)
             obs_n.append(obs)
@@ -535,13 +592,49 @@ class LeMOLAgentTrainer(AgentTrainer):
             act_n.append(act)
 
         # Collect the definitive data for this agent.
-        obs, act, rew, obs_next, done = self.replay_buffer.sample_index(index)[:5]
+        # If we are not performing decentralised LeMOL the opponent
+        # prediction from the time of the action is used as an input
+        # to policy training. In the decentralised case an up-to-date
+        # prediction is made.
+        obs, act, rew, obs_next, done, om_pred = self.replay_buffer.sample_index(index)[:6]
+
+        if self.args.fully_decentralise_lemol:
+            # We use the current opponent representation for all current
+            # opponent modelling
+            h = np.tile(self.current_h, (self.args.batch_size, 1))
+            # Set up the standard opponent model arguments.
+            om_pred_next_args = (np.expand_dims(obs_next, 1), h, False)
+            om_pred_args = (np.expand_dims(obs, 1), h, False)
+            if self.args.recurrent_om_prediction:
+                # Collect the in episode states from the replay buffer.
+                # The in episode LSTM is not updated during a trajectory
+                # so this is a valid approach for up-to-date prediction.
+                om_pred_next_args += tuple(self.replay_buffer.sample_index(index)[-2:])
+                om_pred_args += tuple(self.replay_buffer.sample_index(index)[-4:-2])
+            # Make the opponent model predictions.
+            om_pred_new = self.om_act(*om_pred_args)
+            om_pred_next = self.om_act(*om_pred_next_args)
+            # In the case of a recurrent OM the OM returns new in-play states.
+            # We want to ignore these (for a not recurrent OM it returns an
+            # array of values).
+            if isinstance(om_pred_new, list):
+                om_pred_new = om_pred_new[0]
+            if isinstance(om_pred_next, list):
+                om_pred_next = om_pred_next[0]
+            # Strip out the time dimension
+            # (only of size 1 added to fit placeholders above).
+            om_pred = om_pred_new[:, 0]
+            om_pred_next = om_pred_next[:, 0]
+        else:
+            # If not decentralised we use the opponent's target action
+            # function.
+            om_pred_next = agents[1-lemol_index].p_debug['target_act'](
+                obs_next_n[1-lemol_index])
 
         # train q network
         # Attain the actions for the next step as part of building the TD target.
         target_act_next_n = [None] * len(agents)
-        target_act_next_n[1-lemol_index] = agents[1-lemol_index].p_debug['target_act'](
-            obs_next_n[1-lemol_index])
+        target_act_next_n[1-lemol_index] = om_pred_next
         target_act_next_n[lemol_index] = agents[lemol_index].p_debug['target_act'](
             obs_next_n[lemol_index], target_act_next_n[1-lemol_index]
         )
@@ -554,7 +647,11 @@ class LeMOLAgentTrainer(AgentTrainer):
         q_loss, q = self.q_train(*(obs_n + act_n + [target_q]))
 
         # Update the policy given the new Q network
-        p_loss = self.p_train(*obs_n+[om_pred] + act_n)
+        if self.args.fully_decentralise_lemol:
+            act_n[1-self.agent_index] = om_pred
+            p_loss = self.p_train(*obs_n+[om_pred] + act_n)
+        else:
+            p_loss = self.p_train(*obs_n+[om_pred] + act_n)
 
         # Update the policy and Q networks using polyak averaging.
         self.target_p_update()
@@ -562,6 +659,21 @@ class LeMOLAgentTrainer(AgentTrainer):
 
         # Return the information from training for logging and analysis.
         return [q_loss, p_loss, np.mean(q), np.mean(target_q), np.mean(rew), np.mean(target_q_next), np.std(target_q)]
+
+    def get_initial_in_ep_state(self):
+        assert self.recurrent_om, 'Model Must have a Recurrent Opponent Model to get initial state'
+        self._initial_in_ep_state = U.get_session().run(
+            [self.om_debug['initial_h_in_ep'], self.om_debug['initial_c_in_ep']]
+        )
+        return self._initial_in_ep_state
+
+    @property
+    def initial_in_ep_state(self):
+        assert self.recurrent_om, 'Model Must have a Recurrent Opponent Model to get initial state'
+        if self._initial_in_ep_state is None:
+            return self.get_initial_in_ep_state()
+        else:
+            return self._initial_in_ep_state
 
     def log_om_influence(self, observation, opponent_action_prediction, summary_writer, step):
         # Calculate the derivative of the action with respect to the opponent model output
@@ -602,14 +714,14 @@ class LeMOLAgentTrainer(AgentTrainer):
             # opponent's action in the next time step. The indexing of slicing
             # reflects this.
             lstm_input = np.concatenate([
-                data['opponent_actions'][self.exploration_steps:-1],
-                data['observations'][self.exploration_steps:-1],
-                data['actions'][self.exploration_steps:-1],
-                data['rewards'][self.exploration_steps:-1].reshape(-1, 1),
-                data['terminals'][self.exploration_steps:-1].reshape([-1, 1])
+                data['opponent_actions'][self.exploration_steps:],
+                data['observations'][self.exploration_steps:],
+                data['actions'][self.exploration_steps:],
+                data['rewards'][self.exploration_steps:].reshape(-1, 1),
+                data['terminals'][self.exploration_steps:].reshape([-1, 1])
             ], -1)
-            observations = data['observations'][self.exploration_steps:-1]
-            targets = data['opponent_actions'][self.exploration_steps+1:]
+            observations = data['observations'][self.exploration_steps:]
+            targets = data['opponent_actions'][self.exploration_steps:]
             # If we have not yet added a trajectory then add the first set of
             # data with an added batch dimension.
             if batch['lstm_inputs'] is None:
@@ -631,11 +743,11 @@ class LeMOLAgentTrainer(AgentTrainer):
         losses = []
         # Get initial state
         h, c = U.get_session().run([self.om_debug['initial_h'], self.om_debug['initial_c']])
+        # Work out how many steps it will take to work through one trajectory.
+        # In the case that the length of the trajectory is not divisible by
+        # the chunk length the remainder steps from the floor division are
+        # discarded.
         iterations = batch['observations'].shape[1] // self._chunk_length
-        # Make sure that we use all the data in the case the the length of
-        # trajectory is not divisible by self._chunk_length
-        if batch['observations'].shape[1] % self._chunk_length > 0:
-            iterations += 1
         # Always start by using the initial state.
         use_initial_state = True
         # Work through the trajectory iterations in chunks.
@@ -648,9 +760,16 @@ class LeMOLAgentTrainer(AgentTrainer):
             if self.args.train_lemol_om_on_oh:
                 targets = np.eye(self.om_prediction_dim)[
                     np.argmax(targets, axis=-1)]
+            # If we are using the triplet representation loss we decay the weight
+            # placed on this loss in order to weight the period where learning is
+            # more influential more heavily. Note that this is not used where
+            # we do no use the alternative loss.ß
+            base = self.args.representation_loss_weight_decay_base
+            representation_loss_weight = base / (base + i) * self.args.representation_loss_weight
             # Run the training operation.
             loss, train_summary, h, c = self.om_train(
-                lstm_inputs, observations, targets, h, c, use_initial_state)
+                lstm_inputs, observations, targets, h, c,
+                use_initial_state, representation_loss_weight)
             # Increment the training step counter for logging purposes.
             # This count persists across opponent model training runs.
             self.om_learning_iter += 1
