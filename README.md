@@ -29,10 +29,10 @@ For Multi-Agent Particle Environments (MPE) installation, please refer to https:
 - `--num_adversaries`: number of adversaries in the environment (default: `1`)
 
 - `--good_policy`: algorithm used for the 'good' (non adversary) policies in the environment
-(default: `"maddpg"`; options: {`"mmmaddpg"`, `"maddpg"`, `"ddpg"`, `PPO`, `"lemol"`})
+(default: `"maddpg"`; options: {`"mmmaddpg"`, `"maddpg"`, `"ddpg"`, `"ppo"`, `"lemol"`})
 
 - `--bad_policy`: algorithm used for the adversary policies in the environment
-(default: `"lemol"`; options: {`"mmmaddpg"`, `"maddpg"`, `"ddpg"`, `"PPO"`, `"lemol"`})
+(default: `"lemol"`; options: {`"mmmaddpg"`, `"maddpg"`, `"ddpg"`, `"ppo"`, `"lemol"`})
 
 - `--discrete_actions`: flags that the game should run with discrete (i.e. one-hot) actions.
 (default: `False`)
